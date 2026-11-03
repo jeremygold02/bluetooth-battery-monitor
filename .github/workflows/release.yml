@@ -118,7 +118,10 @@ jobs:
             $type = $assembly.GetType("CodexUsageTray.UpdateService", $true)
             $method = $type.GetMethod("WriteUpdaterScript", [Reflection.BindingFlags]"Static,NonPublic")
             $script = [string](Join-Path $tempDir "update.ps1")
-            $method.Invoke($null, [object[]]@($script, (Join-Path $tempDir "staged.exe"), (Join-Path $tempDir "target.exe"), (Join-Path $tempDir "target.exe.bak"), [int]12345))
+            $staged = [string](Join-Path $tempDir "staged.exe")
+            $target = [string](Join-Path $tempDir "target.exe")
+            $backup = [string](Join-Path $tempDir "target.exe.bak")
+            $method.Invoke($null, [object[]]@($script, $staged, $target, $backup, [int]12345))
             $tokens = $null
             $errors = $null
             [void][Management.Automation.Language.Parser]::ParseFile($script, [ref]$tokens, [ref]$errors)
