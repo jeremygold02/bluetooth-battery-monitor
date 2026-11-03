@@ -1,0 +1,167 @@
+name: Build Windows Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  build-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify current main head
+        shell: pwsh
+        run: |
+          git fetch origin main --no-tags
+          if ($LASTEXITCODE -ne 0) { throw "Could not fetch main." }
+          $mainSha = [string](git rev-parse origin/main)
+          if ($LASTEXITCODE -ne 0 -or -not [string]::Equals($mainSha.Trim(), $env:GITHUB_SHA, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Release SHA $env:GITHUB_SHA is not the current main head $($mainSha.Trim())."
+          }
+
+      - name: Check for an existing release at this commit
+        id: release_guard
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $existingTag = ""
+          $tags = @(git tag --list | Where-Object { $_ -match '^v?\d+\.\d+\.\d+$' })
+          foreach ($tag in $tags) {
+            $tagSha = [string](git rev-list -n 1 $tag)
+            if (-not [string]::Equals($tagSha.Trim(), $env:GITHUB_SHA, [StringComparison]::OrdinalIgnoreCase)) { continue }
+            gh release view $tag --json tagName *> $null
+            if ($LASTEXITCODE -eq 0) { $existingTag = $tag; break }
+          }
+          if ([string]::IsNullOrWhiteSpace($existingTag)) {
+            "skip=false" >> $env:GITHUB_OUTPUT
+          } else {
+            Write-Host "Release $existingTag already targets this commit."
+            "skip=true" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Determine next patch version
+        if: steps.release_guard.outputs.skip != 'true'
+        id: version
+        shell: pwsh
+        run: |
+          $tags = @(git tag --list | ForEach-Object {
+            $tag = [string]$_
+            if ($tag -match '^v?(\d+)\.(\d+)\.(\d+)$') {
+              [pscustomobject]@{ Name = $tag; Version = [version]::new([int]$Matches[1], [int]$Matches[2], [int]$Matches[3]) }
+            }
+          } | Sort-Object -Property Version -Descending)
+          if ($tags.Count -eq 0) {
+            $next = "0.1.0"
+            $previousTag = ""
+          } else {
+            $latest = $tags[0]
+            $next = [version]::new($latest.Version.Major, $latest.Version.Minor, $latest.Version.Build + 1).ToString(3)
+            $previousTag = $latest.Name
+          }
+          "version=$next" >> $env:GITHUB_OUTPUT
+          "previous_tag=$previousTag" >> $env:GITHUB_OUTPUT
+
+      - name: Bake release version
+        if: steps.release_guard.outputs.skip != 'true'
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $parts = $env:GITHUB_REPOSITORY.Split("/")
+          if ($parts.Count -ne 2) { throw "Unexpected repository format: $env:GITHUB_REPOSITORY" }
+          $source = @(
+            "namespace CodexUsageTray",
+            "{",
+            "    internal static class BuildVersion",
+            "    {",
+            "        public const string Version = `"$env:RELEASE_VERSION`";",
+            "        public const string GitHubOwner = `"$($parts[0])`";",
+            "        public const string GitHubRepo = `"$($parts[1])`";",
+            "    }",
+            "}"
+          ) -join [Environment]::NewLine
+          Set-Content -LiteralPath "src\BuildVersion.cs" -Value $source -Encoding UTF8
+
+      - name: Run tests
+        if: steps.release_guard.outputs.skip != 'true'
+        shell: pwsh
+        run: .\tests\run-tests.ps1
+
+      - name: Build executable
+        if: steps.release_guard.outputs.skip != 'true'
+        shell: pwsh
+        run: .\build.ps1
+
+      - name: Validate updater script syntax
+        if: steps.release_guard.outputs.skip != 'true'
+        shell: powershell
+        run: |
+          $tempDir = Join-Path $env:RUNNER_TEMP ("bluetooth-updater-parse-" + [guid]::NewGuid().ToString("N"))
+          New-Item -ItemType Directory -Path $tempDir | Out-Null
+          try {
+            $assembly = [Reflection.Assembly]::LoadFrom((Resolve-Path "BluetoothBatteryMonitor.exe").Path)
+            $type = $assembly.GetType("CodexUsageTray.UpdateService", $true)
+            $method = $type.GetMethod("WriteUpdaterScript", [Reflection.BindingFlags]"Static,NonPublic")
+            $script = [string](Join-Path $tempDir "update.ps1")
+            $method.Invoke($null, [object[]]@($script, (Join-Path $tempDir "staged.exe"), (Join-Path $tempDir "target.exe"), (Join-Path $tempDir "target.exe.bak"), [int]12345))
+            $tokens = $null
+            $errors = $null
+            [void][Management.Automation.Language.Parser]::ParseFile($script, [ref]$tokens, [ref]$errors)
+            if ($errors.Count -ne 0) {
+              $errors | ForEach-Object { Write-Error $_.Message }
+              throw "Generated updater script has PowerShell syntax errors."
+            }
+          } finally {
+            Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Prepare release notes and notices
+        if: steps.release_guard.outputs.skip != 'true'
+        shell: pwsh
+        env:
+          PREVIOUS_TAG: ${{ steps.version.outputs.previous_tag }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:PREVIOUS_TAG)) {
+            $commits = @(git log --pretty=format:"- %s (%h)" --max-count=50)
+          } else {
+            $commits = @(git log --pretty=format:"- %s (%h)" "$env:PREVIOUS_TAG..HEAD")
+          }
+          if ($commits.Count -eq 0) { $commits = @("- No code changes since the previous release.") }
+          $notes = @("## Changes", "") + $commits + @(
+            "", "## Download", "- ``BluetoothBatteryMonitor.exe`` is the Windows tray app.",
+            "- ``ThirdPartyNotices.zip`` contains the included third-party license notices."
+          )
+          Set-Content -LiteralPath "release_notes.md" -Value $notes -Encoding UTF8
+          Compress-Archive -Path "artifacts\build\THIRD_PARTY_NOTICES.md", "artifacts\build\licenses" -DestinationPath "ThirdPartyNotices.zip"
+
+      - name: Create GitHub release
+        if: steps.release_guard.outputs.skip != 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          git fetch origin main --no-tags
+          if ($LASTEXITCODE -ne 0) { throw "Could not recheck main." }
+          $mainSha = [string](git rev-parse origin/main)
+          if ($LASTEXITCODE -ne 0 -or -not [string]::Equals($mainSha.Trim(), $env:GITHUB_SHA, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Main moved while building; a newer run will create the release."
+          }
+          gh release create $env:RELEASE_VERSION "BluetoothBatteryMonitor.exe" "ThirdPartyNotices.zip" `
+            --title $env:RELEASE_VERSION --notes-file "release_notes.md" --target $env:GITHUB_SHA --latest
+          if ($LASTEXITCODE -ne 0) { throw "GitHub release creation failed." }

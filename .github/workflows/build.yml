@@ -1,0 +1,36 @@
+name: Verify Windows Build
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compile:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Compile Bluetooth Battery Monitor
+        shell: pwsh
+        run: |
+          & .\build.ps1
+          if (-not (Test-Path -LiteralPath ".\BluetoothBatteryMonitor.exe")) {
+            throw "Build completed without creating BluetoothBatteryMonitor.exe."
+          }
+          if ((Get-Item -LiteralPath ".\BluetoothBatteryMonitor.exe").Length -le 0) {
+            throw "Build created an empty executable."
+          }
+          foreach ($file in @("BluetoothBatteryMonitor.exe.config", "Wpf.Ui.dll", "Wpf.Ui.Abstractions.dll", "System.Memory.dll", "System.Buffers.dll", "System.Numerics.Vectors.dll", "System.Runtime.CompilerServices.Unsafe.dll")) {
+            if (-not (Test-Path -LiteralPath (Join-Path '.\artifacts\build' $file))) {
+              throw "Build is missing required runtime file: $file"
+            }
+          }

@@ -1,0 +1,10 @@
+# Local build output
+*.exe
+/*.dll
+/*.exe.config
+/artifacts/
+/bin/
+/obj/
+
+# Local batch helpers
+*.bat
