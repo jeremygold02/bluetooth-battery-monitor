@@ -107,6 +107,42 @@ jobs:
         shell: pwsh
         run: .\build.ps1
 
+      - name: Build Inno Setup installer
+        if: steps.release_guard.outputs.skip != 'true'
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $iscc = Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path -LiteralPath $iscc)) {
+            choco install innosetup --no-progress -y
+            if ($LASTEXITCODE -ne 0) { throw "Could not install Inno Setup." }
+          }
+          if (-not (Test-Path -LiteralPath $iscc)) { throw "Inno Setup compiler was not found." }
+          & $iscc "/DMyAppVersion=$env:RELEASE_VERSION" "installer\BluetoothBatteryMonitor.iss"
+          if ($LASTEXITCODE -ne 0) { throw "Installer compilation failed." }
+
+      - name: Smoke test installer and uninstaller
+        if: steps.release_guard.outputs.skip != 'true'
+        shell: pwsh
+        run: |
+          $setup = (Resolve-Path "installer\output\BluetoothBatteryMonitor-Setup.exe").Path
+          $installDir = Join-Path $env:RUNNER_TEMP ("bluetooth-installer-test-" + [guid]::NewGuid().ToString("N"))
+          $shortcut = Join-Path ([Environment]::GetFolderPath('Programs')) "Bluetooth Battery Monitor.lnk"
+          if (Test-Path -LiteralPath $shortcut) { throw "Installer test shortcut already exists." }
+          $settingsPath = Join-Path $env:APPDATA "BluetoothBatteryMonitor\settings.json"
+          $settingsBefore = if (Test-Path -LiteralPath $settingsPath) { (Get-FileHash -LiteralPath $settingsPath).Hash } else { $null }
+          $install = Start-Process -FilePath $setup -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=`"$installDir`"") -WindowStyle Hidden -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "Installer smoke test failed with exit code $($install.ExitCode)." }
+          $exe = Join-Path $installDir "BluetoothBatteryMonitor.exe"
+          $uninstaller = Join-Path $installDir "unins000.exe"
+          if (-not (Test-Path -LiteralPath $exe) -or -not (Test-Path -LiteralPath $uninstaller) -or -not (Test-Path -LiteralPath $shortcut)) { throw "Installer did not create the application, uninstaller, and Start Menu shortcut." }
+          $uninstall = Start-Process -FilePath $uninstaller -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -WindowStyle Hidden -Wait -PassThru
+          if ($uninstall.ExitCode -ne 0) { throw "Uninstaller smoke test failed with exit code $($uninstall.ExitCode)." }
+          if ((Test-Path -LiteralPath $exe) -or (Test-Path -LiteralPath $shortcut)) { throw "Uninstaller did not remove the installed executable and shortcut." }
+          $settingsAfter = if (Test-Path -LiteralPath $settingsPath) { (Get-FileHash -LiteralPath $settingsPath).Hash } else { $null }
+          if ($settingsBefore -ne $settingsAfter) { throw "Installer or uninstaller changed user settings." }
+
       - name: Validate updater script syntax
         if: steps.release_guard.outputs.skip != 'true'
         shell: powershell
@@ -146,7 +182,8 @@ jobs:
           }
           if ($commits.Count -eq 0) { $commits = @("- No code changes since the previous release.") }
           $notes = @("## Changes", "") + $commits + @(
-            "", "## Download", "- ``BluetoothBatteryMonitor.exe`` is the Windows tray app.",
+            "", "## Download", "- ``BluetoothBatteryMonitor-Setup.exe`` installs the Windows tray app.",
+            "- ``BluetoothBatteryMonitor.exe`` is the portable Windows tray app.",
             "- ``ThirdPartyNotices.zip`` contains the included third-party license notices."
           )
           Set-Content -LiteralPath "release_notes.md" -Value $notes -Encoding UTF8
@@ -165,6 +202,6 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or -not [string]::Equals($mainSha.Trim(), $env:GITHUB_SHA, [StringComparison]::OrdinalIgnoreCase)) {
             throw "Main moved while building; a newer run will create the release."
           }
-          gh release create $env:RELEASE_VERSION "BluetoothBatteryMonitor.exe" "ThirdPartyNotices.zip" `
+          gh release create $env:RELEASE_VERSION "BluetoothBatteryMonitor.exe" "installer\output\BluetoothBatteryMonitor-Setup.exe" "ThirdPartyNotices.zip" `
             --title $env:RELEASE_VERSION --notes-file "release_notes.md" --target $env:GITHUB_SHA --latest
           if ($LASTEXITCODE -ne 0) { throw "GitHub release creation failed." }

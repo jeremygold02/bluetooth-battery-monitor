@@ -10,7 +10,7 @@ _The devices and battery values in the screenshots are sample data._
 
 ## Download
 
-Download `BluetoothBatteryMonitor.exe` from the [GitHub Releases page](https://github.com/jeremygold02/bluetooth-battery-monitor/releases/latest) and run it. Third-party license notices are available alongside it.
+Download `BluetoothBatteryMonitor-Setup.exe` from the [GitHub Releases page](https://github.com/jeremygold02/bluetooth-battery-monitor/releases/latest) and run it to install the app for your Windows account. The release also includes `BluetoothBatteryMonitor.exe` if you prefer a portable copy, plus separate third-party license notices.
 
 The app runs on Windows 10 or Windows 11 with .NET Framework 4.8. It does not require Python.
 
