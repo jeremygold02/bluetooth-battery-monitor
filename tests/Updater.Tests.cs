@@ -182,11 +182,15 @@ internal static class UpdaterTests
         try
         {
             int exitCode = RunScript(jobDir, target, staged, backup);
-            Assert(exitCode == (success ? 0 : 1), "unexpected updater result");
+            Assert(exitCode == (success ? 0 : 1), "unexpected updater result: " + exitCode);
             Assert(Hash(target) == (success ? replacementHash : originalHash), "installed executable did not match expected replacement or rollback");
             Assert(File.ReadAllText(unrelated) == "unrelated user file", "existing .bak file was modified");
             Assert(File.Exists(backup) != success, "backup cleanup or failure retention was incorrect");
             AssertRestartArguments(appDir, success);
+        }
+        catch (Exception ex)
+        {
+            throw new Exception("Replacement fixture failed. Updater log: " + ReadUpdaterLog(jobDir), ex);
         }
         finally
         {
@@ -297,6 +301,13 @@ internal static class UpdaterTests
         typeof(UpdateService).GetMethod("WriteUpdaterScript", BindingFlags.Static | BindingFlags.NonPublic)
             .Invoke(null, new object[] { script, staged, target, backup, int.MaxValue });
         return script;
+    }
+
+    private static string ReadUpdaterLog(string jobDir)
+    {
+        string log = Path.Combine(jobDir, "update.log");
+        try { return File.Exists(log) ? File.ReadAllText(log) : "(no updater log was written)"; }
+        catch (IOException ex) { return "(could not read updater log: " + ex.Message + ")"; }
     }
 
     private static Process StartScript(string script)
