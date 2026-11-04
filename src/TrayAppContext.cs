@@ -19,7 +19,7 @@ namespace CodexUsageTray
     internal sealed class TrayAppContext : ApplicationContext
     {
         internal enum UpdateCheckMode { Startup, Periodic, Manual }
-        internal enum UpdateCheckAction { None, InstallAutomatically, PromptInstall, PromptRelease }
+        internal enum UpdateCheckAction { None, InstallAutomatically, NotifyFailure, PromptInstall, PromptRelease }
 
         private const int ActivityPollSeconds = 30;
         private const int UpdateCheckIntervalMilliseconds = 12 * 60 * 60 * 1000;
@@ -42,6 +42,7 @@ namespace CodexUsageTray
         private readonly Stopwatch refreshClock;
         private readonly CancellationTokenSource shutdownCancellation;
         private readonly object updatePreparationLock = new object();
+        private readonly HashSet<string> uninstallableUpdateNotices = new HashSet<string>(StringComparer.Ordinal);
         private readonly bool showUsageOnStart;
         private readonly bool showSettingsOnStart;
 
@@ -1227,9 +1228,17 @@ namespace CodexUsageTray
         internal static UpdateCheckAction DecideUpdateAction(UpdateInfo info, UpdateCheckMode mode)
         {
             if (info == null || !info.UpdateAvailable) return UpdateCheckAction.None;
+            if (mode != UpdateCheckMode.Manual && !info.CanInstall) return UpdateCheckAction.NotifyFailure;
             if (mode == UpdateCheckMode.Startup && info.CanInstall) return UpdateCheckAction.InstallAutomatically;
             if (mode != UpdateCheckMode.Manual) return UpdateCheckAction.None;
             return info.CanInstall ? UpdateCheckAction.PromptInstall : UpdateCheckAction.PromptRelease;
+        }
+
+        internal static bool TryMarkUninstallableUpdateNotice(UpdateInfo info, ISet<string> notices)
+        {
+            if (info == null || !info.UpdateAvailable || info.CanInstall || notices == null) return false;
+            string key = (info.LatestVersion ?? "") + "\n" + (info.Message ?? "");
+            return notices.Add(key);
         }
 
         private void HandleUpdateInfo(UpdateInfo info, UpdateCheckMode mode)
@@ -1260,6 +1269,18 @@ namespace CodexUsageTray
             if (action == UpdateCheckAction.InstallAutomatically)
             {
                 InstallUpdate(info, false);
+                return;
+            }
+            if (action == UpdateCheckAction.NotifyFailure)
+            {
+                if (TryMarkUninstallableUpdateNotice(info, uninstallableUpdateNotices))
+                {
+                    notifyIcon.ShowBalloonTip(5000, "Bluetooth Battery Monitor Update",
+                        string.IsNullOrWhiteSpace(info.Message)
+                            ? "The update could not be installed automatically. Open Settings for details."
+                            : info.Message,
+                        ToolTipIcon.Warning);
+                }
                 return;
             }
             if (action == UpdateCheckAction.None) return;
