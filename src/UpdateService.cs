@@ -5,6 +5,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Net;
+using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
 using System.Web.Script.Serialization;
@@ -76,7 +77,11 @@ namespace CodexUsageTray
                 };
             }
 
-            string latestVersion = AppVersion.DisplayVersion(GetString(release, "tag_name"));
+            string latestVersion;
+            if (!TryParseReleaseVersion(GetString(release, "tag_name"), out latestVersion))
+            {
+                throw new UpdateException("The latest GitHub release has an invalid version tag. Open the release page to review it manually.");
+            }
             string releaseUrl = GetString(release, "html_url");
             if (string.IsNullOrWhiteSpace(releaseUrl))
             {
@@ -151,6 +156,12 @@ namespace CodexUsageTray
             {
                 throw new UpdateException("No update is available.");
             }
+            string expectedVersion;
+            if (!TryParseReleaseVersion(update.LatestVersion, out expectedVersion) ||
+                AppVersion.CompareVersions(expectedVersion, AppVersion.Current) <= 0)
+            {
+                throw new UpdateException("The update version is invalid or is not newer than this app.");
+            }
             if (string.IsNullOrWhiteSpace(update.AssetUrl))
             {
                 throw new UpdateException("The latest release does not include a Windows exe asset.");
@@ -188,6 +199,7 @@ namespace CodexUsageTray
 
             try
             {
+                string originalTargetHash = ComputeSha256(targetExe);
                 string updateId = Guid.NewGuid().ToString("N");
                 tempDir = Path.Combine(Path.GetTempPath(), "bluetooth_battery_monitor_update_" + updateId);
                 downloadedExe = Path.Combine(tempDir, AppVersion.ReleaseAssetName + ".download");
@@ -203,8 +215,9 @@ namespace CodexUsageTray
                 File.Copy(downloadedExe, stagedExe, false);
                 VerifyAssetFile(stagedExe, update.AssetSize, update.AssetSha256);
                 VerifyPortableExecutable(stagedExe);
+                VerifyManagedRelease(stagedExe, expectedVersion);
 
-                WriteUpdaterScript(scriptPath, stagedExe, targetExe, backupExe, Process.GetCurrentProcess().Id);
+                WriteUpdaterScriptCore(scriptPath, stagedExe, targetExe, backupExe, Process.GetCurrentProcess().Id, originalTargetHash);
                 TryDeleteFile(downloadedExe);
                 StartUpdaterScript(powerShellPath, scriptPath, targetExe);
                 updaterStarted = true;
@@ -244,6 +257,55 @@ namespace CodexUsageTray
                     TryDeleteDirectory(tempDir);
                 }
             }
+        }
+
+        internal static bool TryParseReleaseVersion(string tag, out string version)
+        {
+            version = "";
+            if (string.IsNullOrEmpty(tag)) return false;
+            string value = tag.StartsWith("v", StringComparison.Ordinal) ? tag.Substring(1) : tag;
+            string[] parts = value.Split('.');
+            if (parts.Length != 3) return false;
+            foreach (string part in parts)
+            {
+                int number;
+                if (part.Length == 0 || (part.Length > 1 && part[0] == '0') ||
+                    !int.TryParse(part, NumberStyles.None, CultureInfo.InvariantCulture, out number)) return false;
+            }
+            version = value;
+            return true;
+        }
+
+        internal static void VerifyManagedRelease(string path, string expectedVersion)
+        {
+            try
+            {
+                string version;
+                if (!TryParseReleaseVersion(expectedVersion, out version))
+                    throw new UpdateException("The release version is invalid.");
+
+                // Reflection-only loading inspects metadata without executing code in the downloaded file.
+                // Loading bytes avoids keeping the staged executable locked after validation.
+                Assembly assembly = Assembly.ReflectionOnlyLoad(File.ReadAllBytes(path));
+                Type buildVersion = assembly.GetType("CodexUsageTray.BuildVersion", false, false);
+                if (!string.Equals(assembly.GetName().Name, "BluetoothBatteryMonitor", StringComparison.Ordinal) ||
+                    buildVersion == null ||
+                    !string.Equals(ReadMetadataConstant(buildVersion, "Version"), version, StringComparison.Ordinal) ||
+                    !string.Equals(ReadMetadataConstant(buildVersion, "GitHubOwner"), AppVersion.GitHubOwner, StringComparison.OrdinalIgnoreCase) ||
+                    !string.Equals(ReadMetadataConstant(buildVersion, "GitHubRepo"), AppVersion.GitHubRepo, StringComparison.OrdinalIgnoreCase))
+                    throw new UpdateException("The downloaded app identity or version does not match the GitHub release.");
+            }
+            catch (UpdateException) { throw; }
+            catch (Exception ex)
+            {
+                throw new UpdateException("The downloaded app metadata could not be verified. No app files were replaced.", ex);
+            }
+        }
+
+        private static string ReadMetadataConstant(Type type, string name)
+        {
+            FieldInfo field = type.GetField(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+            return field != null && field.IsLiteral && !field.IsInitOnly ? field.GetRawConstantValue() as string : null;
         }
 
         private static Dictionary<string, object> LatestRelease()
@@ -621,18 +683,18 @@ namespace CodexUsageTray
                 throw new UpdateException("The update file size failed verification. No files were replaced.");
             }
 
-            byte[] hash;
-            using (SHA256 sha256 = SHA256.Create())
-            using (FileStream stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
-            {
-                hash = sha256.ComputeHash(stream);
-            }
-
-            string actualSha256 = BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
+            string actualSha256 = ComputeSha256(path);
             if (!string.Equals(actualSha256, expectedSha256, StringComparison.OrdinalIgnoreCase))
             {
                 throw new UpdateException("The update failed SHA-256 verification. No files were replaced.");
             }
+        }
+
+        private static string ComputeSha256(string path)
+        {
+            using (SHA256 sha256 = SHA256.Create())
+            using (FileStream stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
+                return BitConverter.ToString(sha256.ComputeHash(stream)).Replace("-", "").ToLowerInvariant();
         }
 
         private static void VerifyPortableExecutable(string path)
@@ -676,10 +738,22 @@ namespace CodexUsageTray
 
         private static void WriteUpdaterScript(string scriptPath, string stagedExe, string targetExe, string backupExe, int pid)
         {
+            WriteUpdaterScriptCore(scriptPath, stagedExe, targetExe, backupExe, pid,
+                File.Exists(targetExe) ? ComputeSha256(targetExe) : "");
+        }
+
+        private static void WriteUpdaterScriptCore(string scriptPath, string stagedExe, string targetExe, string backupExe, int pid, string targetHash)
+        {
             string logPath = Path.ChangeExtension(scriptPath, ".log");
             string tempDir = Path.GetDirectoryName(scriptPath);
             string rollbackStage = stagedExe + ".rollback";
             string failedExe = stagedExe + ".failed";
+            string lockName;
+            using (SHA256 sha256 = SHA256.Create())
+            {
+                byte[] pathBytes = Encoding.UTF8.GetBytes(Path.GetFullPath(targetExe).ToUpperInvariant());
+                lockName = @"Global\BluetoothBatteryMonitor.Update." + BitConverter.ToString(sha256.ComputeHash(pathBytes)).Replace("-", "");
+            }
             string[] lines = new string[]
             {
                 "$ErrorActionPreference = 'Stop'",
@@ -693,6 +767,8 @@ namespace CodexUsageTray
                 "$pidToWait = " + pid,
                 "$log = " + PowerShellLiteral(logPath),
                 "$startupCheckMilliseconds = " + StartupVerificationMilliseconds,
+                "$expectedTargetHash = " + PowerShellLiteral(targetHash),
+                "$mutexName = " + PowerShellLiteral(lockName),
                 "",
                 "function Write-UpdateLog {",
                 "  param([string]$Message)",
@@ -741,7 +817,7 @@ namespace CodexUsageTray
                 "  }",
                 "",
                 "  Remove-Item -LiteralPath $failedExe -Force -ErrorAction SilentlyContinue",
-                "  $restoredProcess = Start-Process -FilePath $target -WorkingDirectory $appDir -WindowStyle Hidden -PassThru",
+                "  $restoredProcess = Start-Process -FilePath $target -ArgumentList '--skip-startup-update', '--update-failed' -WorkingDirectory $appDir -WindowStyle Hidden -PassThru",
                 "  if ($null -eq $restoredProcess -or $restoredProcess.WaitForExit($startupCheckMilliseconds)) {",
                 "    throw 'The restored app did not remain running.'",
                 "  }",
@@ -750,6 +826,9 @@ namespace CodexUsageTray
                 "$replacementInstalled = $false",
                 "$succeeded = $false",
                 "$exitCode = 0",
+                "$updateMutex = $null",
+                "$lockAcquired = $false",
+                "$skipRestart = $false",
                 "Write-UpdateLog 'Starting Bluetooth Battery Monitor update.'",
                 "try {",
                 "  if (-not (Test-Path -LiteralPath $stagedExe -PathType Leaf)) {",
@@ -757,6 +836,18 @@ namespace CodexUsageTray
                 "  }",
                 "  if (-not (Test-Path -LiteralPath $target -PathType Leaf)) {",
                 "    throw 'The installed executable is missing.'",
+                "  }",
+                "  $skipRestart = $true",
+                "  $updateMutex = [System.Threading.Mutex]::new($false, $mutexName)",
+                "  try { $lockAcquired = $updateMutex.WaitOne(120000) } catch [System.Threading.AbandonedMutexException] { $lockAcquired = $true }",
+                "  if (-not $lockAcquired) {",
+                "    $skipRestart = $true",
+                "    throw 'Another update is still in progress.'",
+                "  }",
+                "  $skipRestart = $false",
+                "  if (-not $expectedTargetHash -or (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash -ne $expectedTargetHash) {",
+                "    $skipRestart = $true",
+                "    throw 'The installed executable changed after this update was prepared.'",
                 "  }",
                 "",
                 "  $deadline = (Get-Date).AddSeconds(20)",
@@ -774,6 +865,10 @@ namespace CodexUsageTray
                 "  }",
                 "  if (@(Get-AppProcesses).Count -gt 0) {",
                 "    throw 'The installed app is still running.'",
+                "  }",
+                "  if ((Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash -ne $expectedTargetHash) {",
+                "    $skipRestart = $true",
+                "    throw 'The installed executable changed before replacement.'",
                 "  }",
                 "",
                 "  if (Test-Path -LiteralPath $backup) {",
@@ -797,7 +892,7 @@ namespace CodexUsageTray
                 "  $replacementInstalled = $true",
                 "",
                 "  Write-UpdateLog 'Starting updated app.'",
-                "  $startedProcess = Start-Process -FilePath $target -WorkingDirectory $appDir -WindowStyle Hidden -PassThru",
+                "  $startedProcess = Start-Process -FilePath $target -ArgumentList '--skip-startup-update', '--update-complete' -WorkingDirectory $appDir -WindowStyle Hidden -PassThru",
                 "  if ($null -eq $startedProcess) {",
                 "    throw 'The updated app process could not be started.'",
                 "  }",
@@ -815,13 +910,13 @@ namespace CodexUsageTray
                 "      Write-UpdateLog 'Restoring previous executable.'",
                 "      Restore-Backup",
                 "      Write-UpdateLog 'Previous executable restored and restarted.'",
-                "    } else {",
+                "    } elseif (-not $skipRestart) {",
                 "      $restartDeadline = (Get-Date).AddSeconds(5)",
                 "      while ((Get-Process -Id $pidToWait -ErrorAction SilentlyContinue) -and (Get-Date) -lt $restartDeadline) {",
                 "        Start-Sleep -Milliseconds 250",
                 "      }",
                 "      if (@(Get-AppProcesses).Count -eq 0) {",
-                "        Start-Process -FilePath $target -WorkingDirectory $appDir -WindowStyle Hidden | Out-Null",
+                "        Start-Process -FilePath $target -ArgumentList '--skip-startup-update', '--update-failed' -WorkingDirectory $appDir -WindowStyle Hidden | Out-Null",
                 "        Write-UpdateLog 'Installed executable restarted after update preparation failed.'",
                 "      }",
                 "    }",
@@ -830,6 +925,8 @@ namespace CodexUsageTray
                 "  }",
                 "  $exitCode = 1",
                 "} finally {",
+                "  if ($lockAcquired) { $updateMutex.ReleaseMutex() }",
+                "  if ($null -ne $updateMutex) { $updateMutex.Dispose() }",
                 "  Remove-Item -LiteralPath $stagedExe -Force -ErrorAction SilentlyContinue",
                 "  Remove-Item -LiteralPath $rollbackStage -Force -ErrorAction SilentlyContinue",
                 "  Remove-Item -LiteralPath $failedExe -Force -ErrorAction SilentlyContinue",

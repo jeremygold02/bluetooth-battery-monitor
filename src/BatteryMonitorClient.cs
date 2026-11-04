@@ -12,6 +12,10 @@ namespace CodexUsageTray
         private static readonly BatteryRateTracker RateTracker = new BatteryRateTracker();
         private static readonly Dictionary<string, BatteryProbeResult> CacheById =
             new Dictionary<string, BatteryProbeResult>(StringComparer.OrdinalIgnoreCase);
+        private static readonly Dictionary<string, DateTime> LastCacheRevisionById =
+            new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+        private static long cacheRevision;
+        private const int MaximumCachedDevices = 512;
 
         public static UsageSnapshot FetchUsage()
         {
@@ -141,6 +145,56 @@ namespace CodexUsageTray
             }
         }
 
+        internal static void InitializeBatteryCache(IEnumerable<CachedBatteryReading> readings)
+        {
+            lock (CacheLock)
+            {
+                CacheById.Clear();
+                LastCacheRevisionById.Clear();
+                cacheRevision = 0;
+                if (readings == null) return;
+                foreach (CachedBatteryReading reading in readings)
+                {
+                    if (reading == null || !IsStableId(reading.Id) || reading.Percent < 0 || reading.Percent > 100 ||
+                        string.IsNullOrWhiteSpace(reading.Name) || reading.Name.Length > 512 ||
+                        string.IsNullOrWhiteSpace(reading.Source) || reading.Source.Length > 512 ||
+                        reading.Priority < -100 || reading.Priority > 100 || reading.ObservedAt == DateTime.MinValue ||
+                        reading.ObservedAt.ToUniversalTime() > DateTime.UtcNow.AddDays(1) || CacheById.ContainsKey(reading.Id)) continue;
+                    CacheById.Add(reading.Id, new BatteryProbeResult { Id = reading.Id, Name = reading.Name,
+                        Source = reading.Source, Percent = reading.Percent, Priority = reading.Priority,
+                        ObservedAt = reading.ObservedAt });
+                    LastCacheRevisionById[reading.Id] = reading.ObservedAt;
+                    if (CacheById.Count >= MaximumCachedDevices) break;
+                }
+            }
+        }
+
+        internal static bool TryGetUpdatedBatteryCache(long savedRevision,
+            out long revision, out List<CachedBatteryReading> readings)
+        {
+            lock (CacheLock)
+            {
+                revision = cacheRevision;
+                if (revision <= savedRevision)
+                {
+                    readings = null;
+                    return false;
+                }
+                readings = new List<CachedBatteryReading>();
+                foreach (BatteryProbeResult reading in CacheById.Values)
+                {
+                    if (!reading.Percent.HasValue) continue;
+                    readings.Add(new CachedBatteryReading { Id = reading.Id, Name = reading.Name, Source = reading.Source,
+                        Percent = reading.Percent.Value, Priority = reading.Priority, ObservedAt = reading.ObservedAt });
+                }
+                readings.Sort(delegate(CachedBatteryReading left, CachedBatteryReading right)
+                {
+                    return StringComparer.OrdinalIgnoreCase.Compare(left.Id, right.Id);
+                });
+                return true;
+            }
+        }
+
         private delegate List<BatteryProbeResult> Collector();
 
         private static void TryCollect(
@@ -170,6 +224,7 @@ namespace CodexUsageTray
             List<BatteryProbeResult> hydrated = new List<BatteryProbeResult>();
             lock (CacheLock)
             {
+                HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 for (int index = 0; index < collected.Count; index++)
                 {
                     BatteryProbeResult current = collected[index];
@@ -178,6 +233,7 @@ namespace CodexUsageTray
                         continue;
                     }
                     Normalize(current, attemptedAt);
+                    seen.Add(current.Id);
                     if (current.Percent.HasValue)
                     {
                         Cache(current);
@@ -190,12 +246,19 @@ namespace CodexUsageTray
                             current.Percent = cached.Percent;
                             current.ObservedAt = cached.ObservedAt;
                             current.IsCached = true;
-                            current.Status = "Last reported " +
-                                TimeFormatter.FormatClock(cached.ObservedAt) +
-                                " · sleeping or unavailable";
+                            current.Status = CachedStatus(cached.ObservedAt);
                         }
                     }
                     hydrated.Add(current);
+                }
+                foreach (BatteryProbeResult cached in CacheById.Values)
+                {
+                    if (seen.Contains(cached.Id)) continue;
+                    BatteryProbeResult missing = cached.Clone();
+                    missing.IsCached = true;
+                    missing.Status = CachedStatus(cached.ObservedAt);
+                    missing.BatteryEstimate = null;
+                    hydrated.Add(missing);
                 }
             }
 
@@ -253,8 +316,38 @@ namespace CodexUsageTray
 
         private static void Cache(BatteryProbeResult value)
         {
+            if (!IsStableId(value.Id) || value.Name.Length > 512 || value.Source.Length > 512 ||
+                value.Priority < -100 || value.Priority > 100) return;
+            BatteryProbeResult previous;
+            bool exists = CacheById.TryGetValue(value.Id, out previous);
+            if (!exists && CacheById.Count >= MaximumCachedDevices) return;
+            DateTime previousRevision;
+            bool revisionDue = !exists || previous.Percent != value.Percent ||
+                !string.Equals(previous.Name, value.Name, StringComparison.Ordinal) ||
+                !string.Equals(previous.Source, value.Source, StringComparison.Ordinal) || previous.Priority != value.Priority ||
+                !LastCacheRevisionById.TryGetValue(value.Id, out previousRevision) ||
+                value.ObservedAt - previousRevision >= TimeSpan.FromMinutes(15);
             BatteryProbeResult clone = value.Clone();
             CacheById[clone.Id] = clone;
+            if (revisionDue)
+            {
+                cacheRevision++;
+                LastCacheRevisionById[clone.Id] = clone.ObservedAt;
+            }
+        }
+
+        private static bool IsStableId(string id)
+        {
+            if (string.IsNullOrWhiteSpace(id) || id.Length > 2048) return false;
+            Guid generated;
+            return !(id.StartsWith("device:", StringComparison.OrdinalIgnoreCase) &&
+                Guid.TryParseExact(id.Substring(7), "N", out generated));
+        }
+
+        private static string CachedStatus(DateTime observedAt)
+        {
+            return "Last reported " + observedAt.ToLocalTime().ToString("g", CultureInfo.CurrentCulture) +
+                " · sleeping or unavailable";
         }
 
         private static BatteryProbeResult FindCached(BatteryProbeResult value)

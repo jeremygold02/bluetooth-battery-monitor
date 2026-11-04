@@ -18,6 +18,9 @@ namespace CodexUsageTray
 {
     internal sealed class TrayAppContext : ApplicationContext
     {
+        internal enum UpdateCheckMode { Startup, Periodic, Manual }
+        internal enum UpdateCheckAction { None, InstallAutomatically, Notify, PromptInstall, PromptRelease }
+
         private const int ActivityPollSeconds = 30;
         private const int UpdateCheckIntervalMilliseconds = 12 * 60 * 60 * 1000;
         private const int ShowWindowRestore = 9;
@@ -49,6 +52,7 @@ namespace CodexUsageTray
         private int? lastFiveHourThresholdLevel;
         private long lastRefreshStartedMilliseconds = -1;
         private long savedBatteryRateRevision;
+        private long savedBatteryCacheRevision;
         private DateTime lastAttemptedAt = DateTime.MinValue;
         private bool codexRunning;
         private bool refreshInProgress;
@@ -79,6 +83,7 @@ namespace CodexUsageTray
             dispatcher.CreateControl();
             settings = AppSettings.Load();
             BatteryMonitorClient.InitializeBatteryRates(settings.LearnedBatteryRates);
+            BatteryMonitorClient.InitializeBatteryCache(settings.CachedBatteryReadings);
             SystemEvents.PowerModeChanged += OnPowerModeChanged;
             usagePopup = CreateUsagePopup();
 
@@ -136,9 +141,22 @@ namespace CodexUsageTray
             RefreshUsageIfDue(false);
             updateTimer = new System.Windows.Forms.Timer();
             updateTimer.Interval = UpdateCheckIntervalMilliseconds;
-            updateTimer.Tick += delegate { CheckForUpdates(false); };
+            updateTimer.Tick += delegate { CheckForUpdates(UpdateCheckMode.Periodic); };
             updateTimer.Start();
-            CheckForUpdates(false);
+            if (HasArg(args, "--update-failed"))
+            {
+                SetUpdateStatusText("The previous update failed. The app was restored; check for updates to retry.");
+                notifyIcon.ShowBalloonTip(5000, "Bluetooth Battery Monitor Update", updateStatusText, ToolTipIcon.Warning);
+            }
+            else if (HasArg(args, "--update-complete"))
+            {
+                SetUpdateStatusText("Updated to version " + AppVersion.Current + ".");
+                notifyIcon.ShowBalloonTip(5000, "Bluetooth Battery Monitor Update", updateStatusText, ToolTipIcon.Info);
+            }
+            if (ShouldCheckForStartupUpdate(args))
+            {
+                CheckForUpdates(UpdateCheckMode.Startup);
+            }
             if (showUsageOnStart || showSettingsOnStart)
             {
                 startupUiTimer = new System.Windows.Forms.Timer();
@@ -159,6 +177,11 @@ namespace CodexUsageTray
                 };
                 startupUiTimer.Start();
             }
+        }
+
+        internal static bool ShouldCheckForStartupUpdate(string[] args)
+        {
+            return !HasArg(args, "--skip-startup-update");
         }
 
         private static bool HasArg(string[] args, string value)
@@ -231,7 +254,7 @@ namespace CodexUsageTray
             menu.Items.Add(settingsItem);
 
             ToolStripMenuItem checkUpdates = new ToolStripMenuItem("Check for updates");
-            checkUpdates.Click += delegate { CheckForUpdates(true); };
+            checkUpdates.Click += delegate { CheckForUpdates(UpdateCheckMode.Manual); };
             menu.Items.Add(checkUpdates);
 
             menu.Items.Add(new ToolStripSeparator());
@@ -407,6 +430,7 @@ namespace CodexUsageTray
             else
             {
                 PersistLearnedBatteryRates(task.Result);
+                PersistBatteryCache(task.Result);
                 ApplySuccessfulSnapshot(task.Result, showFeedback);
             }
 
@@ -431,6 +455,24 @@ namespace CodexUsageTray
             if (snapshot != null)
             {
                 string warning = "Could not save learned battery rates; check the settings file.";
+                snapshot.StatusMessage = string.IsNullOrEmpty(snapshot.StatusMessage)
+                    ? warning : snapshot.StatusMessage + " " + warning;
+            }
+        }
+
+        private void PersistBatteryCache(UsageSnapshot snapshot)
+        {
+            long revision;
+            List<CachedBatteryReading> readings;
+            if (!BatteryMonitorClient.TryGetUpdatedBatteryCache(savedBatteryCacheRevision, out revision, out readings)) return;
+            if (settings.TrySaveBatteryCache(readings))
+            {
+                savedBatteryCacheRevision = revision;
+                return;
+            }
+            if (snapshot != null)
+            {
+                string warning = "Could not save last known battery levels; check the settings file.";
                 snapshot.StatusMessage = string.IsNullOrEmpty(snapshot.StatusMessage)
                     ? warning : snapshot.StatusMessage + " " + warning;
             }
@@ -920,7 +962,7 @@ namespace CodexUsageTray
 
         private int GetThresholdLevel(LimitWindow window)
         {
-            if (window == null)
+            if (window == null || window.IsCached)
             {
                 return 0;
             }
@@ -1014,7 +1056,7 @@ namespace CodexUsageTray
             settingsForm.SetUpdateStatus(updateStatusText);
             settingsForm.SetUpdateButtonState(updateCheckInProgress || updateInstallInProgress,
                 updateInstallInProgress ? "Installing..." : "Checking...");
-            settingsForm.UpdateCheckRequested += delegate { CheckForUpdates(true); };
+            settingsForm.UpdateCheckRequested += delegate { CheckForUpdates(UpdateCheckMode.Manual); };
             settingsForm.SettingsApplied += delegate
             {
                 ApplyStartupSetting();
@@ -1116,7 +1158,7 @@ namespace CodexUsageTray
             return usagePopup;
         }
 
-        private void CheckForUpdates(bool interactive)
+        private void CheckForUpdates(UpdateCheckMode mode)
         {
             if (shuttingDown)
             {
@@ -1125,7 +1167,7 @@ namespace CodexUsageTray
 
             if (updateCheckInProgress || updateInstallInProgress)
             {
-                if (interactive)
+                if (mode == UpdateCheckMode.Manual)
                 {
                     MessageBox.Show(GetSettingsOwner(), "An update check is already running.", "Bluetooth Battery Monitor Updates", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 }
@@ -1162,22 +1204,30 @@ namespace CodexUsageTray
                     }
                     else if (task.IsFaulted)
                     {
-                        HandleUpdateError(task.Exception, interactive, false);
+                        HandleUpdateError(task.Exception, mode == UpdateCheckMode.Manual, false);
                     }
                     else
                     {
-                        HandleUpdateInfo(task.Result, interactive);
+                        HandleUpdateInfo(task.Result, mode);
                     }
                 });
             }, CancellationToken.None, TaskContinuationOptions.None, TaskScheduler.Default);
         }
 
-        private void HandleUpdateInfo(UpdateInfo info, bool interactive)
+        internal static UpdateCheckAction DecideUpdateAction(UpdateInfo info, UpdateCheckMode mode)
+        {
+            if (info == null || !info.UpdateAvailable) return UpdateCheckAction.None;
+            if (mode == UpdateCheckMode.Startup && info.CanInstall) return UpdateCheckAction.InstallAutomatically;
+            if (mode != UpdateCheckMode.Manual) return UpdateCheckAction.Notify;
+            return info.CanInstall ? UpdateCheckAction.PromptInstall : UpdateCheckAction.PromptRelease;
+        }
+
+        private void HandleUpdateInfo(UpdateInfo info, UpdateCheckMode mode)
         {
             if (info == null)
             {
                 SetUpdateStatusText("Could not read update information.");
-                if (interactive)
+                if (mode == UpdateCheckMode.Manual)
                 {
                     MessageBox.Show(GetSettingsOwner(), "Could not read update information.", "Bluetooth Battery Monitor Updates", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 }
@@ -1187,26 +1237,36 @@ namespace CodexUsageTray
             if (!info.UpdateAvailable)
             {
                 SetUpdateStatusText(string.IsNullOrEmpty(info.LatestVersion) ? info.Message : "Up to date: " + info.LatestVersion);
-                if (interactive)
+                if (mode == UpdateCheckMode.Manual)
                 {
                     MessageBox.Show(GetSettingsOwner(), info.Message, "Bluetooth Battery Monitor Updates", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 }
                 return;
             }
 
-            SetUpdateStatusText("Version " + info.LatestVersion + " available");
+            SetUpdateStatusText(info.CanInstall ? "Version " + info.LatestVersion + " available" : info.Message);
 
-            if (!interactive)
+            UpdateCheckAction action = DecideUpdateAction(info, mode);
+            if (action == UpdateCheckAction.InstallAutomatically)
+            {
+                notifyIcon.ShowBalloonTip(5000, "Bluetooth Battery Monitor Update",
+                    "Version " + info.LatestVersion + " is available and will install automatically.", ToolTipIcon.Info);
+                InstallUpdate(info, false);
+                return;
+            }
+            if (action == UpdateCheckAction.Notify)
             {
                 notifyIcon.ShowBalloonTip(
                     5000,
                     "Bluetooth Battery Monitor Update",
-                    "Version " + info.LatestVersion + " is available. Open Settings and choose Check Updates to install it.",
-                    ToolTipIcon.Info);
+                    info.CanInstall
+                        ? "Version " + info.LatestVersion + " is available. Open Settings and choose Check Updates to install it."
+                        : "Version " + info.LatestVersion + " is available, but cannot be installed automatically. Open Settings for details.",
+                    info.CanInstall ? ToolTipIcon.Info : ToolTipIcon.Warning);
                 return;
             }
 
-            if (info.CanInstall)
+            if (action == UpdateCheckAction.PromptInstall)
             {
                 DialogResult result = MessageBox.Show(
                     GetSettingsOwner(),
@@ -1216,7 +1276,7 @@ namespace CodexUsageTray
                     MessageBoxIcon.Information);
                 if (result == DialogResult.Yes)
                 {
-                    InstallUpdate(info);
+                    InstallUpdate(info, true);
                 }
                 return;
             }
@@ -1233,7 +1293,7 @@ namespace CodexUsageTray
             }
         }
 
-        private void InstallUpdate(UpdateInfo info)
+        private void InstallUpdate(UpdateInfo info, bool interactive)
         {
             if (shuttingDown || updateInstallInProgress)
             {
@@ -1273,7 +1333,7 @@ namespace CodexUsageTray
                     {
                         updateInstallInProgress = false;
                         SetSettingsUpdateButtonState(false, null);
-                        HandleUpdateError(task.Exception, true, true);
+                        HandleUpdateError(task.Exception, interactive, true);
                         return;
                     }
 
@@ -1287,10 +1347,15 @@ namespace CodexUsageTray
         {
             Exception baseException = exception != null ? exception.GetBaseException() : null;
             string message = baseException != null ? baseException.Message : "Unknown update error.";
-            SetUpdateStatusText(installing ? "Update installation failed." : "Update check failed.");
+            SetUpdateStatusText((installing ? "Update installation failed: " : "Update check failed: ") + message);
 
             if (!interactive)
             {
+                if (installing)
+                {
+                    notifyIcon.ShowBalloonTip(5000, "Bluetooth Battery Monitor Update",
+                        "Automatic update failed. Open Settings and check for updates to retry.", ToolTipIcon.Warning);
+                }
                 return;
             }
 
@@ -1357,6 +1422,7 @@ namespace CodexUsageTray
             {
             }
             PersistLearnedBatteryRates(null);
+            PersistBatteryCache(null);
 
             refreshTimer.Stop();
             refreshTimer.Dispose();

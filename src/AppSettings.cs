@@ -9,7 +9,7 @@ namespace CodexUsageTray
 {
     internal sealed class AppSettings
     {
-        public const int CurrentSettingsVersion = 8;
+        public const int CurrentSettingsVersion = 9;
         public const string DefaultTrayBoxColor = "#0078D7";
         public const string DefaultTrayTextColor = "#FFFFFF";
         public const string IconMetricWeekly = "Lowest";
@@ -57,6 +57,7 @@ namespace CodexUsageTray
         public string TrayTextColor { get; set; }
         public string Theme { get; set; }
         public List<LearnedBatteryRate> LearnedBatteryRates { get; set; }
+        public List<CachedBatteryReading> CachedBatteryReadings { get; set; }
 
         internal bool IsSaveBlockedByNewerVersion
         {
@@ -95,12 +96,14 @@ namespace CodexUsageTray
             TrayTextColor = DefaultTrayTextColor;
             Theme = ThemeSystem;
             LearnedBatteryRates = new List<LearnedBatteryRate>();
+            CachedBatteryReadings = new List<CachedBatteryReading>();
         }
 
         internal AppSettings Clone()
         {
             AppSettings clone = (AppSettings)MemberwiseClone();
             clone.LearnedBatteryRates = CopyLearnedBatteryRates(LearnedBatteryRates);
+            clone.CachedBatteryReadings = CopyCachedBatteryReadings(CachedBatteryReadings);
             return clone;
         }
 
@@ -133,6 +136,7 @@ namespace CodexUsageTray
             TrayTextColor = source.TrayTextColor;
             Theme = source.Theme;
             LearnedBatteryRates = CopyLearnedBatteryRates(source.LearnedBatteryRates);
+            CachedBatteryReadings = CopyCachedBatteryReadings(source.CachedBatteryReadings);
             observedSettingsPath = source.observedSettingsPath;
             observedSettingsContents = source.observedSettingsContents;
             observedSettingsExists = source.observedSettingsExists;
@@ -148,6 +152,15 @@ namespace CodexUsageTray
                 if (rate == null) continue;
                 result.Add(rate.Clone());
             }
+            return result;
+        }
+
+        private static List<CachedBatteryReading> CopyCachedBatteryReadings(IEnumerable<CachedBatteryReading> source)
+        {
+            List<CachedBatteryReading> result = new List<CachedBatteryReading>();
+            if (source != null)
+                foreach (CachedBatteryReading reading in source)
+                    if (reading != null) result.Add(reading.Clone());
             return result;
         }
 
@@ -188,6 +201,33 @@ namespace CodexUsageTray
         internal bool TrySaveLearnedBatteryRates(List<LearnedBatteryRate> rates)
         {
             return TrySaveLearnedBatteryRatesToPath(GetSettingsPath(), rates);
+        }
+
+        internal bool TrySaveBatteryCache(List<CachedBatteryReading> readings)
+        {
+            return TrySaveBatteryCacheToPath(GetSettingsPath(), readings);
+        }
+
+        private bool TrySaveBatteryCacheToPath(string path, List<CachedBatteryReading> readings)
+        {
+            try
+            {
+                if (automaticSaveBlocked || saveBlockedByNewerVersion ||
+                    !string.Equals(observedSettingsPath, path, StringComparison.OrdinalIgnoreCase)) return false;
+                bool exists = File.Exists(path);
+                if (exists != observedSettingsExists ||
+                    (exists && !string.Equals(File.ReadAllText(path), observedSettingsContents, StringComparison.Ordinal))) return false;
+
+                AppSettings candidate = Clone();
+                candidate.CachedBatteryReadings = CopyCachedBatteryReadings(readings);
+                candidate.SaveToPath(path);
+                CopyValuesFrom(candidate);
+                return true;
+            }
+            catch (Exception)
+            {
+                return false;
+            }
         }
 
         private bool TrySaveLearnedBatteryRatesToPath(string path, List<LearnedBatteryRate> rates)
@@ -341,20 +381,31 @@ namespace CodexUsageTray
             }
             catch
             {
-                string rateKey = null;
+                List<string> optionalKeys = new List<string>();
                 foreach (string key in values.Keys)
                 {
-                    if (string.Equals(key, "LearnedBatteryRates", StringComparison.OrdinalIgnoreCase))
-                    {
-                        rateKey = key;
-                        break;
-                    }
+                    if (string.Equals(key, "LearnedBatteryRates", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(key, "CachedBatteryReadings", StringComparison.OrdinalIgnoreCase))
+                        optionalKeys.Add(key);
                 }
-                if (rateKey == null) throw;
-                values.Remove(rateKey);
-                AppSettings result = serializer.ConvertToType<AppSettings>(values);
+                for (int i = 0; i < optionalKeys.Count; i++)
+                {
+                    Dictionary<string, object> withoutField = new Dictionary<string, object>(values);
+                    withoutField.Remove(optionalKeys[i]);
+                    try
+                    {
+                        AppSettings result = serializer.ConvertToType<AppSettings>(withoutField);
+                        ignoredMalformedRates = true;
+                        return result;
+                    }
+                    catch { }
+                }
+                if (optionalKeys.Count < 2) throw;
+                Dictionary<string, object> withoutHistory = new Dictionary<string, object>(values);
+                foreach (string key in optionalKeys) withoutHistory.Remove(key);
+                AppSettings fallback = serializer.ConvertToType<AppSettings>(withoutHistory);
                 ignoredMalformedRates = true;
-                return result;
+                return fallback;
             }
         }
 
@@ -467,6 +518,7 @@ namespace CodexUsageTray
         private void Normalize(int sourceVersion)
         {
             LearnedBatteryRates = CopyLearnedBatteryRates(LearnedBatteryRates);
+            CachedBatteryReadings = CopyCachedBatteryReadings(CachedBatteryReadings);
             OverlayNumber = true;
             if (sourceVersion < 6)
             {

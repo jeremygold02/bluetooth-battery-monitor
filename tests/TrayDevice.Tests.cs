@@ -73,6 +73,7 @@ internal static class TrayDeviceTests
         BindingFlags flags = BindingFlags.NonPublic | BindingFlags.Static;
         MethodInfo load = typeof(AppSettings).GetMethod("LoadFromPath", flags);
         MethodInfo saveRates = typeof(AppSettings).GetMethod("TrySaveLearnedBatteryRatesToPath", BindingFlags.NonPublic | BindingFlags.Instance);
+        MethodInfo saveCache = typeof(AppSettings).GetMethod("TrySaveBatteryCacheToPath", BindingFlags.NonPublic | BindingFlags.Instance);
         List<LearnedBatteryRate> rates = new List<LearnedBatteryRate>
         {
             new LearnedBatteryRate { DeviceId = "mouse", DischargeSamples = new List<LearnedBatteryRateSample>
@@ -98,6 +99,20 @@ internal static class TrayDeviceTests
             Assert(restored.LearnedBatteryRates[0].DischargeSamples[0].Percent == 3,
                 "settings copies do not share mutable rate history");
 
+            List<CachedBatteryReading> readings = new List<CachedBatteryReading>
+            {
+                new CachedBatteryReading { Id = "mouse", Name = "Mouse", Source = "Logitech", Percent = 64,
+                    Priority = 30, ObservedAt = DateTime.Now.AddMinutes(-2) }
+            };
+            Assert((bool)saveCache.Invoke(restored, new object[] { path, readings }), "cached battery readings save to settings");
+            restored = (AppSettings)load.Invoke(null, new object[] { path });
+            Assert(restored.RefreshSeconds == 120 && restored.LearnedBatteryRates.Count == 1 &&
+                restored.CachedBatteryReadings.Count == 1 && restored.CachedBatteryReadings[0].Percent == 64,
+                "cached battery readings, rates and other settings survive a restart");
+            AppSettings clonedCache = restored.Clone();
+            clonedCache.CachedBatteryReadings[0].Percent = 9;
+            Assert(restored.CachedBatteryReadings[0].Percent == 64, "settings copies do not share cached readings");
+
             string valid = File.ReadAllText(path);
             JavaScriptSerializer serializer = new JavaScriptSerializer();
             IDictionary<string, object> values = (IDictionary<string, object>)serializer.DeserializeObject(valid);
@@ -106,6 +121,8 @@ internal static class TrayDeviceTests
             File.WriteAllText(path, externalEdit);
             Assert(!(bool)saveRates.Invoke(restored, new object[] { path, rates }) && File.ReadAllText(path) == externalEdit,
                 "automatic rate saves do not overwrite an externally edited settings file");
+            Assert(!(bool)saveCache.Invoke(restored, new object[] { path, readings }) && File.ReadAllText(path) == externalEdit,
+                "automatic cache saves do not overwrite an externally edited settings file");
 
             File.WriteAllText(path, "{broken");
             File.WriteAllText(backup, valid);
@@ -113,6 +130,8 @@ internal static class TrayDeviceTests
             Assert(recovered.RefreshSeconds == 120 && !(bool)saveRates.Invoke(recovered, new object[] { path, rates }) &&
                 File.ReadAllText(path) == "{broken" && File.ReadAllText(backup) == valid,
                 "automatic rate saves preserve invalid primary files and recovery backups");
+            Assert(!(bool)saveCache.Invoke(recovered, new object[] { path, readings }),
+                "automatic cache saves preserve invalid primary files and recovery backups");
 
             string malformedRates = "{\"SettingsVersion\":" + AppSettings.CurrentSettingsVersion +
                 ",\"RefreshSeconds\":120,\"LearnedBatteryRates\":\"invalid\"}";
@@ -123,11 +142,23 @@ internal static class TrayDeviceTests
                 !(bool)saveRates.Invoke(partial, new object[] { path, rates }) && File.ReadAllText(path) == malformedRates,
                 "malformed rate data does not erase other settings or trigger an automatic overwrite");
 
+            IDictionary<string, object> malformedCacheValues = (IDictionary<string, object>)serializer.DeserializeObject(valid);
+            malformedCacheValues["CachedBatteryReadings"] = "invalid";
+            string malformedCache = serializer.Serialize(malformedCacheValues);
+            File.WriteAllText(path, malformedCache);
+            AppSettings partialCache = (AppSettings)load.Invoke(null, new object[] { path });
+            Assert(partialCache.RefreshSeconds == 120 && partialCache.LearnedBatteryRates.Count == 1 &&
+                partialCache.CachedBatteryReadings.Count == 0 &&
+                !(bool)saveCache.Invoke(partialCache, new object[] { path, readings }) && File.ReadAllText(path) == malformedCache,
+                "malformed cached readings retain settings and rates without automatic overwrite");
+
             string newer = "{\"SettingsVersion\":" + (AppSettings.CurrentSettingsVersion + 1) + ",\"RefreshSeconds\":180}";
             File.WriteAllText(path, newer);
             AppSettings protectedSettings = (AppSettings)load.Invoke(null, new object[] { path });
             Assert(!(bool)saveRates.Invoke(protectedSettings, new object[] { path, rates }) && File.ReadAllText(path) == newer,
                 "automatic rate saves respect newer settings versions");
+            Assert(!(bool)saveCache.Invoke(protectedSettings, new object[] { path, readings }) && File.ReadAllText(path) == newer,
+                "automatic cache saves respect newer settings versions");
         }
         finally
         {

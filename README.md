@@ -21,7 +21,7 @@ The app runs on Windows 10 or Windows 11 with .NET Framework 4.8. It does not re
 - Estimate charging and discharge rates from observed battery-level changes, with separate rolling histories for charging and usage.
 - Customize the tray icon background and text colors, theme, notification thresholds, popup details, refresh interval, and Windows startup behavior.
 - Refresh manually or automatically, including after a Bluetooth LE connection or disconnection.
-- Check for updates at startup and every 12 hours, or manually from Settings or the tray menu. Installation requires confirmation.
+- Automatically install available updates at startup. Check every 12 hours and notify you when an update is available; you can also check manually from Settings or the tray menu.
 
 ## Supported devices
 
@@ -50,7 +50,7 @@ Cached and unavailable readings do not contribute to the estimate. An interrupte
 - Left-click the tray icon to open or close the popup. Use its refresh button or **Refresh now** in the tray menu to check immediately.
 - Open Settings from the popup gear or tray menu. A specific-device selection changes the tray icon; the popup can still show the other devices.
 - Hover over a device for labeled battery, source, status, and rate details. Scroll the list when more devices are present than fit in the popup.
-- A sleeping or unavailable device may show its last successful value as cached. The cached value is kept in memory for the current app session and is identified in the popup.
+- A sleeping, disconnected, or unavailable device can show its last successful battery value, labeled as a cached reading. The app saves these readings locally so they remain available after a restart.
 
 ![Bluetooth Battery Monitor settings showing tray icon choices, preview, colors, and theme](docs/images/battery-settings.png)
 
@@ -88,7 +88,7 @@ powershell -ExecutionPolicy Bypass -File .\tools\run-battery-collectors-probe.ps
 
 ## Privacy
 
-Device readings are collected locally. Preferences and learned rate samples, keyed by device identifier, are stored in `%APPDATA%\BluetoothBatteryMonitor\settings.json`. The app contacts GitHub for release checks and update downloads; it has no separate telemetry or analytics service.
+Device readings are collected locally. Preferences, last-known battery readings, and learned rate samples, keyed by device identifier, are stored in `%APPDATA%\BluetoothBatteryMonitor\settings.json`. The app contacts GitHub for release checks and update downloads; it has no separate telemetry or analytics service.
 
 ## Attribution
 
