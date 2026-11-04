@@ -9,9 +9,15 @@ namespace CodexUsageTray
         private const ushort LogitechVendorId = 0x046D;
         private const ushort HidppUsagePage = 0xFF00;
         private const ushort HidppLongUsage = 0x0002;
+        private const ushort X3ReceiverProductId = 0xC54F;
+        private const ushort X3UsagePage = 0xFF43;
+        private const ushort X3LongUsage = 0x0302;
         private const ushort BatteryStatusFeature = 0x1000;
         private const ushort UnifiedBatteryFeature = 0x1004;
         private const ushort DeviceNameFeature = 0x0005;
+
+        internal delegate byte[] HidExchange(byte[] request, Func<byte[], bool> responseMatcher,
+            int timeoutMilliseconds, bool allowFeatureReportFallback);
 
         public static List<BatteryProbeResult> Collect()
         {
@@ -25,11 +31,7 @@ namespace CodexUsageTray
             for (int interfaceIndex = 0; interfaceIndex < interfaces.Count; interfaceIndex++)
             {
                 HidDeviceInfo device = interfaces[interfaceIndex];
-                if (device.VendorId != LogitechVendorId ||
-                    device.UsagePage != HidppUsagePage ||
-                    device.Usage != HidppLongUsage ||
-                    device.InputReportLength < 20 ||
-                    device.OutputReportLength < 20)
+                if (!IsSupportedInterface(device))
                 {
                     continue;
                 }
@@ -38,37 +40,7 @@ namespace CodexUsageTray
                 {
                     using (HidDeviceConnection connection = new HidDeviceConnection(device))
                     {
-                        bool anyResponse = false;
-                        for (byte deviceIndex = 1; deviceIndex <= 6; deviceIndex++)
-                        {
-                            bool responded;
-                            BatteryProbeResult result = ReadDevice(
-                                connection,
-                                device,
-                                deviceIndex,
-                                out responded);
-                            if (!responded)
-                            {
-                                break;
-                            }
-                            anyResponse = true;
-                            if (result != null)
-                            {
-                                results.Add(result);
-                            }
-                        }
-
-                        if (!anyResponse)
-                        {
-                            BatteryProbeResult sleeping = new BatteryProbeResult();
-                            sleeping.Id = CreateId(device, 1);
-                            sleeping.Name = "Logitech wireless device";
-                            sleeping.Source = "Logitech LIGHTSPEED";
-                            sleeping.Status = "Sleeping or unavailable";
-                            sleeping.Priority = 30;
-                            sleeping.ObservedAt = DateTime.Now;
-                            results.Add(sleeping);
-                        }
+                        ReadDevices(device, connection.Exchange, results);
                     }
                 }
                 catch (Exception ex)
@@ -84,8 +56,85 @@ namespace CodexUsageTray
             return results;
         }
 
+        internal static bool IsSupportedInterface(HidDeviceInfo device)
+        {
+            if (device == null || device.VendorId != LogitechVendorId ||
+                device.InputReportLength < 20 || device.OutputReportLength < 20) return false;
+            return (device.UsagePage == HidppUsagePage && device.Usage == HidppLongUsage) ||
+                IsX3Receiver(device);
+        }
+
+        private static bool IsX3Receiver(HidDeviceInfo device)
+        {
+            return device.ProductId == X3ReceiverProductId && device.UsagePage == X3UsagePage &&
+                device.Usage == X3LongUsage;
+        }
+
+        internal static void ReadDevices(HidDeviceInfo device, HidExchange exchange, List<BatteryProbeResult> results)
+        {
+            bool x3Receiver = IsX3Receiver(device);
+            bool anyResponse = false;
+            for (byte deviceIndex = 1; deviceIndex <= 6; deviceIndex++)
+            {
+                bool responded;
+                BatteryProbeResult result = x3Receiver
+                    ? ReadX3Device(exchange, device, deviceIndex, out responded)
+                    : ReadDevice(exchange, device, deviceIndex, out responded);
+                if (!responded)
+                {
+                    if (x3Receiver) continue;
+                    break;
+                }
+                anyResponse = true;
+                if (result != null) results.Add(result);
+            }
+
+            if (!anyResponse && !x3Receiver)
+            {
+                BatteryProbeResult sleeping = new BatteryProbeResult();
+                sleeping.Id = CreateId(device, 1);
+                sleeping.Name = "Logitech wireless device";
+                sleeping.Source = "Logitech LIGHTSPEED";
+                sleeping.Status = "Sleeping or unavailable";
+                sleeping.Priority = 30;
+                sleeping.ObservedAt = DateTime.Now;
+                results.Add(sleeping);
+            }
+        }
+
+        private static BatteryProbeResult ReadX3Device(HidExchange exchange, HidDeviceInfo receiver,
+            byte deviceIndex, out bool responded)
+        {
+            responded = false;
+            // The C54F receiver itself answers at FF; paired mice answer in slots 1–6.
+            // Probe the confirmed X3 battery feature first so a silent slot costs one timeout.
+            byte[] root = Request(exchange, deviceIndex, 0, 0, new byte[] { 0x10, 0x04 });
+            if (root == null || root.Length < 7 || IsProtocolError(root)) return null;
+            responded = true;
+
+            byte batteryStatus = 0;
+            ushort batteryFeature = UnifiedBatteryFeature;
+            int? percent = root[4] == 0 ? null : ReadBatteryByIndex(exchange, deviceIndex, root[4], 0x10, out batteryStatus);
+            if (!percent.HasValue)
+            {
+                batteryFeature = BatteryStatusFeature;
+                percent = ReadBattery(exchange, deviceIndex, BatteryStatusFeature, 0x00, out batteryStatus, ref responded);
+            }
+
+            string name = ReadDeviceName(exchange, deviceIndex, ref responded);
+            BatteryProbeResult result = new BatteryProbeResult();
+            result.Id = CreateId(receiver, deviceIndex);
+            result.Name = string.IsNullOrWhiteSpace(name) ? "Logitech wireless device" : name;
+            result.Percent = percent;
+            result.Source = "Logitech LIGHTSPEED";
+            result.Status = percent.HasValue ? FormatBatteryStatus(batteryFeature, batteryStatus) : "Sleeping or unavailable";
+            result.Priority = 30;
+            result.ObservedAt = DateTime.Now;
+            return result;
+        }
+
         private static BatteryProbeResult ReadDevice(
-            HidDeviceConnection connection,
+            HidExchange connection,
             HidDeviceInfo receiver,
             byte deviceIndex,
             out bool responded)
@@ -140,7 +189,7 @@ namespace CodexUsageTray
         }
 
         private static int? ReadBattery(
-            HidDeviceConnection connection,
+            HidExchange connection,
             byte deviceIndex,
             ushort featureId,
             byte function,
@@ -158,17 +207,20 @@ namespace CodexUsageTray
                 return null;
             }
 
-            byte[] response = Request(
-                connection,
-                deviceIndex,
-                featureIndex.Value,
-                function,
-                new byte[0]);
+            int? percent = ReadBatteryByIndex(connection, deviceIndex, featureIndex.Value, function, out status);
+            if (percent.HasValue) responded = true;
+            return percent;
+        }
+
+        private static int? ReadBatteryByIndex(HidExchange connection, byte deviceIndex, byte featureIndex,
+            byte function, out byte status)
+        {
+            status = 0;
+            byte[] response = Request(connection, deviceIndex, featureIndex, function, new byte[0]);
             if (response == null)
             {
                 return null;
             }
-            responded = true;
             if (response.Length < 7 || IsProtocolError(response))
             {
                 return null;
@@ -179,7 +231,7 @@ namespace CodexUsageTray
         }
 
         private static string ReadDeviceName(
-            HidDeviceConnection connection,
+            HidExchange connection,
             byte deviceIndex,
             ref bool responded)
         {
@@ -240,7 +292,7 @@ namespace CodexUsageTray
         }
 
         private static byte? GetFeatureIndex(
-            HidDeviceConnection connection,
+            HidExchange connection,
             byte deviceIndex,
             ushort featureId,
             ref bool responded)
@@ -270,7 +322,7 @@ namespace CodexUsageTray
         }
 
         private static byte[] Request(
-            HidDeviceConnection connection,
+            HidExchange connection,
             byte deviceIndex,
             byte featureIndex,
             byte function,
@@ -292,7 +344,7 @@ namespace CodexUsageTray
                     Math.Min(16, parameters.Length));
             }
 
-            return connection.Exchange(
+            return connection(
                 request,
                 delegate(byte[] response)
                 {

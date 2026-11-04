@@ -22,6 +22,7 @@ if (-not $windowsMetadata -or -not $universalContract -or -not $foundationContra
 $suites = @(
     @{ File = "BatteryRateTracker.Tests.cs"; Main = "BatteryRateTrackerTests"; Arguments = @() },
     @{ File = "BatteryMonitorClient.Tests.cs"; Main = "BatteryMonitorClientTests"; Arguments = @() },
+    @{ File = "LogitechHidBatteryCollector.Tests.cs"; Main = "LogitechHidBatteryCollectorTests"; Arguments = @() },
     @{ File = "TrayDevice.Tests.cs"; Main = "TrayDeviceTests"; Arguments = @() },
     @{ File = "Updater.Tests.cs"; Main = "UpdaterTests"; Arguments = @() },
     @{ File = "PopupUi.Tests.cs"; Main = "PopupUiTests"; Arguments = @($PopupScreenshot | Where-Object { $_ }) },

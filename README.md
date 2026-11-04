@@ -29,6 +29,7 @@ The monitor combines local Windows and device-protocol sources:
 
 - The Windows `System.Devices.BatteryLife` property and Bluetooth LE Battery Service, including charging state when a device reports it.
 - Logitech HID++ battery features `0x1000` and `0x1004`, used by compatible LIGHTSPEED receivers.
+- The PRO X3 SUPERSTRIKE LIGHTSPEED receiver (`046D:C54F`), using its 20-byte HID++ interface; physical-device validation is pending.
 - HyperX Cloud III S Wireless dongle battery and charging-state responses for HP USB product IDs `02CC` and `06BE`.
 
 The current collectors have been verified with a Logitech G305 LIGHTSPEED mouse and a HyperX Cloud III S Wireless headset. Other devices can work when they expose a supported Windows, Bluetooth, or HID battery interface; detection and available details vary by device.
