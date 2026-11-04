@@ -316,6 +316,8 @@ internal static class UpdaterTests
         ProcessStartInfo start = new ProcessStartInfo(powershell, "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"" + script + "\"");
         start.UseShellExecute = false;
         start.CreateNoWindow = true;
+        // PowerShell 7 can pass a module path that Windows PowerShell cannot use.
+        start.EnvironmentVariables["PSModulePath"] = Path.Combine(Path.GetTempPath(), "BluetoothMissingModules-" + Guid.NewGuid().ToString("N"));
         return Process.Start(start);
     }
 
