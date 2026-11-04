@@ -150,7 +150,40 @@ namespace CodexUsageTray
             };
         }
 
-        public static string InstallUpdate(UpdateInfo update)
+        internal sealed class PreparedUpdate : IDisposable
+        {
+            private readonly string stagedExe;
+            private readonly string tempDir;
+            private readonly string powerShellPath;
+            private readonly string scriptPath;
+            private readonly string targetExe;
+            private bool started;
+
+            internal PreparedUpdate(string stagedExe, string tempDir, string powerShellPath, string scriptPath, string targetExe)
+            {
+                this.stagedExe = stagedExe;
+                this.tempDir = tempDir;
+                this.powerShellPath = powerShellPath;
+                this.scriptPath = scriptPath;
+                this.targetExe = targetExe;
+            }
+
+            internal void Start()
+            {
+                if (started) throw new InvalidOperationException("The update installer has already started.");
+                StartUpdaterScript(powerShellPath, scriptPath, targetExe);
+                started = true;
+            }
+
+            public void Dispose()
+            {
+                if (started) return;
+                TryDeleteFile(stagedExe);
+                TryDeleteDirectory(tempDir);
+            }
+        }
+
+        public static PreparedUpdate PrepareUpdate(UpdateInfo update)
         {
             if (update == null || !update.UpdateAvailable)
             {
@@ -195,7 +228,7 @@ namespace CodexUsageTray
             string downloadedExe = "";
             string stagedExe = "";
             string scriptPath = "";
-            bool updaterStarted = false;
+            bool preparationComplete = false;
 
             try
             {
@@ -219,10 +252,9 @@ namespace CodexUsageTray
 
                 WriteUpdaterScriptCore(scriptPath, stagedExe, targetExe, backupExe, Process.GetCurrentProcess().Id, originalTargetHash);
                 TryDeleteFile(downloadedExe);
-                StartUpdaterScript(powerShellPath, scriptPath, targetExe);
-                updaterStarted = true;
-
-                return "Update verified. Bluetooth Battery Monitor will restart automatically.";
+                PreparedUpdate prepared = new PreparedUpdate(stagedExe, tempDir, powerShellPath, scriptPath, targetExe);
+                preparationComplete = true;
+                return prepared;
             }
             catch (UpdateException)
             {
@@ -251,7 +283,7 @@ namespace CodexUsageTray
             }
             finally
             {
-                if (!updaterStarted)
+                if (!preparationComplete)
                 {
                     TryDeleteFile(stagedExe);
                     TryDeleteDirectory(tempDir);
@@ -770,6 +802,7 @@ namespace CodexUsageTray
                 "$startupCheckMilliseconds = " + StartupVerificationMilliseconds,
                 "$expectedTargetHash = " + PowerShellLiteral(targetHash),
                 "$mutexName = " + PowerShellLiteral(lockName),
+                "$restartSessionId = [System.Diagnostics.Process]::GetCurrentProcess().SessionId",
                 "",
                 "function Write-UpdateLog {",
                 "  param([string]$Message)",
@@ -803,12 +836,12 @@ namespace CodexUsageTray
                 "    throw 'The previous executable backup is missing.'",
                 "  }",
                 "",
-                "  $newProcesses = @(Get-AppProcesses)",
-                "  foreach ($process in $newProcesses) {",
-                "    Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue",
-                "  }",
-                "  if ($newProcesses.Count -gt 0) {",
+                "  if ($null -ne $startedProcess -and -not $startedProcess.HasExited) {",
+                "    Stop-Process -Id $startedProcess.Id -Force -ErrorAction SilentlyContinue",
                 "    Start-Sleep -Milliseconds 800",
+                "  }",
+                "  if (@(Get-AppProcesses).Count -gt 0) {",
+                "    throw 'Another app instance is running; its settings were left untouched.'",
                 "  }",
                 "",
                 "  Remove-Item -LiteralPath $rollbackStage -Force -ErrorAction SilentlyContinue",
@@ -843,6 +876,7 @@ namespace CodexUsageTray
                 "$updateMutex = $null",
                 "$lockAcquired = $false",
                 "$skipRestart = $false",
+                "$startedProcess = $null",
                 "Write-UpdateLog 'Starting Bluetooth Battery Monitor update.'",
                 "try {",
                 "  if (-not (Test-Path -LiteralPath $stagedExe -PathType Leaf)) {",
@@ -860,7 +894,6 @@ namespace CodexUsageTray
                 "  }",
                 "  $skipRestart = $false",
                 "  if (-not $expectedTargetHash -or (Get-ExecutableSha256 $target) -ne $expectedTargetHash) {",
-                "    $skipRestart = $true",
                 "    throw 'The installed executable changed after this update was prepared.'",
                 "  }",
                 "",
@@ -871,17 +904,9 @@ namespace CodexUsageTray
                 "",
                 "  $remaining = @(Get-AppProcesses)",
                 "  if ($remaining.Count -gt 0) {",
-                "    Write-UpdateLog \"Stopping $($remaining.Count) old app process(es).\"",
-                "    foreach ($process in $remaining) {",
-                "      Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue",
-                "    }",
-                "    Start-Sleep -Milliseconds 800",
-                "  }",
-                "  if (@(Get-AppProcesses).Count -gt 0) {",
-                "    throw 'The installed app is still running.'",
+                "    throw 'Another app instance is still running; its settings were left untouched.'",
                 "  }",
                 "  if ((Get-ExecutableSha256 $target) -ne $expectedTargetHash) {",
-                "    $skipRestart = $true",
                 "    throw 'The installed executable changed before replacement.'",
                 "  }",
                 "",
@@ -929,7 +954,8 @@ namespace CodexUsageTray
                 "      while ((Get-Process -Id $pidToWait -ErrorAction SilentlyContinue) -and (Get-Date) -lt $restartDeadline) {",
                 "        Start-Sleep -Milliseconds 250",
                 "      }",
-                "      if (@(Get-AppProcesses).Count -eq 0) {",
+                "      $sameSession = @(Get-AppProcesses | Where-Object { $_.SessionId -eq $restartSessionId })",
+                "      if ($sameSession.Count -eq 0) {",
                 "        Start-Process -FilePath $target -ArgumentList '--skip-startup-update', '--update-failed' -WorkingDirectory $appDir -WindowStyle Hidden | Out-Null",
                 "        Write-UpdateLog 'Installed executable restarted after update preparation failed.'",
                 "      }",

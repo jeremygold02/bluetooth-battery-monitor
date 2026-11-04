@@ -19,7 +19,7 @@ namespace CodexUsageTray
     internal sealed class TrayAppContext : ApplicationContext
     {
         internal enum UpdateCheckMode { Startup, Periodic, Manual }
-        internal enum UpdateCheckAction { None, InstallAutomatically, Notify, PromptInstall, PromptRelease }
+        internal enum UpdateCheckAction { None, InstallAutomatically, PromptInstall, PromptRelease }
 
         private const int ActivityPollSeconds = 30;
         private const int UpdateCheckIntervalMilliseconds = 12 * 60 * 60 * 1000;
@@ -41,6 +41,7 @@ namespace CodexUsageTray
         private readonly AppSettings settings;
         private readonly Stopwatch refreshClock;
         private readonly CancellationTokenSource shutdownCancellation;
+        private readonly object updatePreparationLock = new object();
         private readonly bool showUsageOnStart;
         private readonly bool showSettingsOnStart;
 
@@ -64,6 +65,9 @@ namespace CodexUsageTray
         private string updateStatusText = "";
         private SettingsForm settingsForm;
         private System.Windows.Forms.Timer startupUiTimer;
+        private System.Windows.Forms.Timer updateWaitTimer;
+        private UpdateService.PreparedUpdate preparedUpdate;
+        private bool preparedUpdateInteractive;
 
         [DllImport("user32.dll")]
         [return: MarshalAs(UnmanagedType.Bool)]
@@ -151,7 +155,6 @@ namespace CodexUsageTray
             else if (HasArg(args, "--update-complete"))
             {
                 SetUpdateStatusText("Updated to version " + AppVersion.Current + ".");
-                notifyIcon.ShowBalloonTip(5000, "Bluetooth Battery Monitor Update", updateStatusText, ToolTipIcon.Info);
             }
             if (ShouldCheckForStartupUpdate(args))
             {
@@ -1057,6 +1060,13 @@ namespace CodexUsageTray
             settingsForm.SetUpdateButtonState(updateCheckInProgress || updateInstallInProgress,
                 updateInstallInProgress ? "Installing..." : "Checking...");
             settingsForm.UpdateCheckRequested += delegate { CheckForUpdates(UpdateCheckMode.Manual); };
+            SettingsForm openedSettingsForm = settingsForm;
+            settingsForm.UnsavedChangesChanged += delegate { TryPostToUi(TryFinishPreparedUpdate); };
+            settingsForm.FormClosed += delegate
+            {
+                if (ReferenceEquals(settingsForm, openedSettingsForm)) settingsForm = null;
+                TryPostToUi(TryFinishPreparedUpdate);
+            };
             settingsForm.SettingsApplied += delegate
             {
                 ApplyStartupSetting();
@@ -1218,7 +1228,7 @@ namespace CodexUsageTray
         {
             if (info == null || !info.UpdateAvailable) return UpdateCheckAction.None;
             if (mode == UpdateCheckMode.Startup && info.CanInstall) return UpdateCheckAction.InstallAutomatically;
-            if (mode != UpdateCheckMode.Manual) return UpdateCheckAction.Notify;
+            if (mode != UpdateCheckMode.Manual) return UpdateCheckAction.None;
             return info.CanInstall ? UpdateCheckAction.PromptInstall : UpdateCheckAction.PromptRelease;
         }
 
@@ -1249,22 +1259,10 @@ namespace CodexUsageTray
             UpdateCheckAction action = DecideUpdateAction(info, mode);
             if (action == UpdateCheckAction.InstallAutomatically)
             {
-                notifyIcon.ShowBalloonTip(5000, "Bluetooth Battery Monitor Update",
-                    "Version " + info.LatestVersion + " is available and will install automatically.", ToolTipIcon.Info);
                 InstallUpdate(info, false);
                 return;
             }
-            if (action == UpdateCheckAction.Notify)
-            {
-                notifyIcon.ShowBalloonTip(
-                    5000,
-                    "Bluetooth Battery Monitor Update",
-                    info.CanInstall
-                        ? "Version " + info.LatestVersion + " is available. Open Settings and choose Check Updates to install it."
-                        : "Version " + info.LatestVersion + " is available, but cannot be installed automatically. Open Settings for details.",
-                    info.CanInstall ? ToolTipIcon.Info : ToolTipIcon.Warning);
-                return;
-            }
+            if (action == UpdateCheckAction.None) return;
 
             if (action == UpdateCheckAction.PromptInstall)
             {
@@ -1301,6 +1299,7 @@ namespace CodexUsageTray
             }
 
             updateInstallInProgress = true;
+            preparedUpdateInteractive = interactive;
             SetSettingsUpdateButtonState(true, "Installing...");
             SetUpdateStatusText("Installing version " + info.LatestVersion + "...");
 
@@ -1309,18 +1308,31 @@ namespace CodexUsageTray
                 delegate
                 {
                     cancellationToken.ThrowIfCancellationRequested();
-                    return UpdateService.InstallUpdate(info);
+                    return UpdateService.PrepareUpdate(info);
                 },
                 cancellationToken,
                 TaskCreationOptions.None,
-                TaskScheduler.Default).ContinueWith(delegate(Task<string> task)
+                TaskScheduler.Default).ContinueWith(delegate(Task<UpdateService.PreparedUpdate> task)
             {
                 if (task.IsFaulted)
                 {
                     AggregateException ignored = task.Exception;
                 }
 
-                TryPostToUi(delegate
+                if (task.Status == TaskStatus.RanToCompletion)
+                {
+                    lock (updatePreparationLock)
+                    {
+                        if (shuttingDown)
+                        {
+                            task.Result.Dispose();
+                            return;
+                        }
+                        preparedUpdate = task.Result;
+                    }
+                }
+
+                bool posted = TryPostToUi(delegate
                 {
                     if (task.IsCanceled)
                     {
@@ -1337,10 +1349,94 @@ namespace CodexUsageTray
                         return;
                     }
 
-                    notifyIcon.ShowBalloonTip(2000, "Bluetooth Battery Monitor Updates", task.Result, ToolTipIcon.Info);
-                    ExitThread();
+                    TryFinishPreparedUpdate();
                 });
+                if (!posted && task.Status == TaskStatus.RanToCompletion)
+                {
+                    lock (updatePreparationLock)
+                    {
+                        if (ReferenceEquals(preparedUpdate, task.Result)) preparedUpdate = null;
+                    }
+                    task.Result.Dispose();
+                }
             }, CancellationToken.None, TaskContinuationOptions.None, TaskScheduler.Default);
+        }
+
+        internal static bool TryHandoffWhenReady(Func<bool> hasUnsavedSettings, Func<bool> anotherInstanceRunning, Action handoff)
+        {
+            if (hasUnsavedSettings() || anotherInstanceRunning()) return false;
+            handoff();
+            return true;
+        }
+
+        private bool AnotherInstalledInstanceRunning()
+        {
+            Process[] processes;
+            try
+            {
+                processes = Process.GetProcessesByName(Path.GetFileNameWithoutExtension(Application.ExecutablePath));
+            }
+            catch (Exception)
+            {
+                return true;
+            }
+
+            bool anotherInstance = false;
+            int currentId = Process.GetCurrentProcess().Id;
+            foreach (Process process in processes)
+            {
+                try
+                {
+                    if (process.Id != currentId && string.Equals(process.MainModule.FileName,
+                        Application.ExecutablePath, StringComparison.OrdinalIgnoreCase)) anotherInstance = true;
+                }
+                catch (InvalidOperationException) { }
+                catch (Exception) { anotherInstance = true; }
+                finally { process.Dispose(); }
+            }
+            return anotherInstance;
+        }
+
+        private void TryFinishPreparedUpdate()
+        {
+            UpdateService.PreparedUpdate prepared;
+            lock (updatePreparationLock) { prepared = preparedUpdate; }
+            if (shuttingDown || prepared == null) return;
+
+            bool unsaved = false;
+            try
+            {
+                // Settings cannot change on this UI thread between the final check and exit.
+                bool started = TryHandoffWhenReady(
+                    delegate { unsaved = settingsForm != null && !settingsForm.IsDisposed && settingsForm.HasUnsavedChanges; return unsaved; },
+                    AnotherInstalledInstanceRunning,
+                    prepared.Start);
+                if (!started)
+                {
+                    SetUpdateStatusText(unsaved
+                        ? "Update ready; waiting for unsaved settings to be saved or closed."
+                        : "Update ready; waiting for other running instances to close.");
+                    if (updateWaitTimer == null)
+                    {
+                        updateWaitTimer = new System.Windows.Forms.Timer();
+                        updateWaitTimer.Interval = 2000;
+                        updateWaitTimer.Tick += delegate { TryFinishPreparedUpdate(); };
+                    }
+                    updateWaitTimer.Start();
+                    return;
+                }
+                if (updateWaitTimer != null) updateWaitTimer.Stop();
+                lock (updatePreparationLock) { preparedUpdate = null; }
+                ExitThread();
+            }
+            catch (Exception ex)
+            {
+                lock (updatePreparationLock) { preparedUpdate = null; }
+                prepared.Dispose();
+                updateInstallInProgress = false;
+                SetSettingsUpdateButtonState(false, null);
+                HandleUpdateError(new AggregateException(ex), preparedUpdateInteractive, true);
+            }
         }
 
         private void HandleUpdateError(AggregateException exception, bool interactive, bool installing)
@@ -1420,6 +1516,20 @@ namespace CodexUsageTray
             }
             catch (ObjectDisposedException)
             {
+            }
+            if (updateWaitTimer != null)
+            {
+                updateWaitTimer.Stop();
+                updateWaitTimer.Dispose();
+                updateWaitTimer = null;
+            }
+            lock (updatePreparationLock)
+            {
+                if (preparedUpdate != null)
+                {
+                    preparedUpdate.Dispose();
+                    preparedUpdate = null;
+                }
             }
             PersistLearnedBatteryRates(null);
             PersistBatteryCache(null);

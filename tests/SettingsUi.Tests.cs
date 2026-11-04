@@ -47,6 +47,7 @@ internal static class SettingsUiTests
                 Layout(view, 960, 640);
                 Check(!(bool)form.Visible, "settings form is never shown");
                 Check((int)Field(view, "selectedPage") == 2, "tray icon page is initially selected");
+                TestUnsavedChanges(form, view, snapshot);
 
                 for (int page = 0; page < 4; page++)
                 {
@@ -168,7 +169,132 @@ internal static class SettingsUiTests
             }
         }
         TestSmallWindow(settings, snapshot, outputDirectory);
+        TestUpdateHandoffWithSettings();
         Console.WriteLine("Settings WPF headless checks passed.");
+    }
+
+    private static void TestUpdateHandoffWithSettings()
+    {
+        string tempRoot = Path.GetFullPath(Path.GetTempPath()).TrimEnd(Path.DirectorySeparatorChar);
+        string directory = Path.GetFullPath(Path.Combine(tempRoot, "BluetoothSettingsSaveTests-" + Guid.NewGuid().ToString("N")));
+        Check(string.Equals(Path.GetDirectoryName(directory), tempRoot, StringComparison.OrdinalIgnoreCase), "isolated settings path stays in temp");
+        Directory.CreateDirectory(directory);
+        string path = Path.Combine(directory, "settings.json");
+        try
+        {
+            using (SettingsForm form = new SettingsForm(new AppSettings(), new UsageSnapshot()))
+            {
+                int handoffs = 0;
+                Func<bool> dirty = delegate { return !form.IsDisposed && form.HasUnsavedChanges; };
+                Action handoff = delegate { handoffs++; };
+                Check(!dirty(), "update preparation can start with clean settings");
+                FrameworkElement view = (FrameworkElement)Field(form, "settingsView");
+                Wpf.Ui.Controls.NumberBox refresh = (Wpf.Ui.Controls.NumberBox)Field(view, "refresh");
+                refresh.Value = 120;
+                Check(!TrayAppContext.TryHandoffWhenReady(dirty, delegate { return false; }, handoff) && handoffs == 0,
+                    "an edit made during update preparation defers restart");
+
+                bool appliedWhileDirty = false;
+                form.SettingsApplied += delegate { appliedWhileDirty = form.HasUnsavedChanges; };
+                MethodInfo saveToPath = typeof(AppSettings).GetMethod("SaveToPath", PrivateInstance);
+                bool saved = form.TryApplyToSettingsUsing(delegate(AppSettings candidate)
+                {
+                    saveToPath.Invoke(candidate, new object[] { path });
+                });
+                Check(saved && File.Exists(path) && appliedWhileDirty && !form.HasUnsavedChanges,
+                    "successful isolated save applies settings before clearing pending edits");
+                Check(TrayAppContext.TryHandoffWhenReady(dirty, delegate { return false; }, handoff) && handoffs == 1,
+                    "restart resumes after settings are saved");
+            }
+
+            using (SettingsForm form = new SettingsForm(new AppSettings(), new UsageSnapshot()))
+            {
+                int handoffs = 0;
+                Func<bool> dirty = delegate { return !form.IsDisposed && form.HasUnsavedChanges; };
+                bool closeNotified = false;
+                form.FormClosed += delegate { closeNotified = true; };
+                FrameworkElement view = (FrameworkElement)Field(form, "settingsView");
+                ((Wpf.Ui.Controls.NumberBox)Field(view, "refresh")).Value = 120;
+                Check(!TrayAppContext.TryHandoffWhenReady(dirty, delegate { return false; }, delegate { handoffs++; }),
+                    "unsaved settings defer restart before closing");
+                IntPtr hiddenHandle = form.Handle;
+                form.Close();
+                Check(hiddenHandle != IntPtr.Zero && form.IsDisposed && closeNotified && TrayAppContext.TryHandoffWhenReady(dirty, delegate { return false; }, delegate { handoffs++; }) && handoffs == 1,
+                    "closing and discarding settings lets restart resume");
+            }
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+            string backup = path + ".bak";
+            if (File.Exists(backup)) File.Delete(backup);
+            Directory.Delete(directory);
+        }
+    }
+
+    private static void TestUnsavedChanges(SettingsForm form, FrameworkElement view, UsageSnapshot snapshot)
+    {
+        int changes = 0;
+        form.UnsavedChangesChanged += delegate { changes++; };
+        Check(!form.HasUnsavedChanges, "initial settings are clean");
+        form.UpdateDevices(snapshot);
+        Check(!form.HasUnsavedChanges && changes == 0, "refreshing the device list leaves settings clean");
+        UsageSnapshot reordered = new UsageSnapshot();
+        reordered.Devices.Add(new LimitWindow { DeviceId = "device-a", DisplayName = "A mouse", BatteryPercent = 20 });
+        reordered.Devices.Add(new LimitWindow { DeviceId = "headset", DisplayName = "Renamed headset", BatteryPercent = 40 });
+        form.UpdateDevices(reordered);
+        Check(!form.HasUnsavedChanges && changes == 0, "device reordering and updated labels do not create unsaved edits");
+        form.UpdateDevices(snapshot);
+        MethodInfo setModalEdit = typeof(SettingsForm).GetMethod("SetModalSettingsEditInProgress", PrivateInstance);
+        setModalEdit.Invoke(form, new object[] { true });
+        Check(form.HasUnsavedChanges, "an open color picker prevents a restart before a selection is committed");
+        setModalEdit.Invoke(form, new object[] { false });
+        Check(!form.HasUnsavedChanges, "canceling the color picker clears the pending edit");
+
+        Click(FindByName<Wpf.Ui.Controls.Button>(view, "Dark teal background"));
+        Check(form.HasUnsavedChanges, "choosing a fixed color is dirty");
+        Click((Wpf.Ui.Controls.Button)Field(view, "autoColor"));
+        Check(!form.HasUnsavedChanges, "returning to automatic background is clean");
+
+        Wpf.Ui.Controls.NumberBox preview = (Wpf.Ui.Controls.NumberBox)Field(view, "previewPercent");
+        preview.Value = 75;
+        Check(!form.HasUnsavedChanges, "preview-only edits are not unsaved settings");
+        preview.Value = 50;
+
+        Wpf.Ui.Controls.NumberBox refresh = (Wpf.Ui.Controls.NumberBox)Field(view, "refresh");
+        string originalText = refresh.Text;
+        refresh.Text = "invalid";
+        Check(form.HasUnsavedChanges, "invalid numeric text is protected before it is committed");
+        refresh.Text = originalText;
+        Check(!form.HasUnsavedChanges, "reverting uncommitted numeric text clears the dirty state");
+        refresh.Text = "90";
+        Check(form.HasUnsavedChanges, "uncommitted numeric text is protected");
+        refresh.Text = originalText;
+        Check(!form.HasUnsavedChanges, "reverting numeric text clears the dirty state");
+        refresh.Value = 120;
+        Check(form.HasUnsavedChanges, "a committed numeric edit is dirty");
+        refresh.Value = 60;
+        Check(!form.HasUnsavedChanges, "reverting a committed numeric edit is clean");
+
+        ComboBox devices = (ComboBox)Field(view, "device");
+        devices.SelectedIndex = 1;
+        Check(form.HasUnsavedChanges, "selecting another device is dirty");
+        form.UpdateDevices(snapshot);
+        Check(form.HasUnsavedChanges, "refreshing devices preserves an unsaved selection");
+        devices.SelectedIndex = 0;
+        Check(!form.HasUnsavedChanges, "restoring the selected device is clean");
+        ((System.Windows.Forms.ComboBox)Field(form, "deviceCombo")).SelectedIndex = -1;
+        Check(form.HasUnsavedChanges, "a missing required device selection is protected");
+        form.UpdateDevices(snapshot);
+        Check(!form.HasUnsavedChanges, "restoring the original device clears the invalid selection");
+
+        CheckBox startup = (CheckBox)Field(view, "start");
+        bool originalStartup = startup.IsChecked == true;
+        startup.IsChecked = !originalStartup;
+        Check(form.HasUnsavedChanges, "changing a checkbox is dirty");
+        startup.IsChecked = originalStartup;
+        Check(!form.HasUnsavedChanges, "reverting a checkbox is clean");
+        Check(changes >= 8, "dirty-state changes raise notifications");
     }
 
     private static void TestSmallWindow(AppSettings settings, UsageSnapshot snapshot, string outputDirectory)

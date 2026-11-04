@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Windows;
 using System.Windows.Automation;
@@ -494,12 +495,27 @@ namespace CodexUsageTray
                 return box;
             }
 
-            private static WpfNumberBox NumberBox(double min, double max, string label)
+            private WpfNumberBox NumberBox(double min, double max, string label)
             {
                 WpfNumberBox box = new WpfNumberBox { Minimum = min, Maximum = max, SmallChange = 1, MaxDecimalPlaces = 0,
                     Width = 145, MinHeight = 30, Margin = new Thickness(0, 0, 4, 0) };
                 AutomationProperties.SetName(box, label);
+                box.TextChanged += delegate { if (!syncing) owner.RefreshUnsavedChanges(); };
                 return box;
+            }
+
+            internal bool HasPendingNumericInput()
+            {
+                return HasPendingNumericInput(refresh) || HasPendingNumericInput(critical) || HasPendingNumericInput(low);
+            }
+
+            private static bool HasPendingNumericInput(WpfNumberBox box)
+            {
+                if (box == null) return false;
+                double value;
+                return !box.Value.HasValue || !double.TryParse(box.Text, NumberStyles.Float | NumberStyles.AllowThousands,
+                    CultureInfo.CurrentCulture, out value) || double.IsNaN(value) || double.IsInfinity(value) ||
+                    value != box.Value.Value;
             }
 
             private static WpfButton SmallButton(string text)
@@ -552,6 +568,7 @@ namespace CodexUsageTray
                 if (critical != null) critical.Value = (double)owner.criticalNumeric.Value;
                 if (low != null) low.Value = (double)owner.lowNumeric.Value;
                 syncing = old;
+                if (!syncing) owner.RefreshUnsavedChanges();
             }
 
             public void RefreshStatus()
@@ -621,6 +638,7 @@ namespace CodexUsageTray
                 if (theme != null) theme.SelectedItem = owner.GetSelectedTheme();
                 RefreshNumbers(); RefreshDevices(); RefreshStatus(); RefreshUpdateButtonState(); RefreshPreview();
                 syncing = false;
+                owner.RefreshUnsavedChanges();
             }
         }
     }

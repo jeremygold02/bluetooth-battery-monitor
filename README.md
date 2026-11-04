@@ -21,7 +21,7 @@ The app runs on Windows 10 or Windows 11 with .NET Framework 4.8. It does not re
 - Estimate charging and discharge rates from observed battery-level changes, with separate rolling histories for charging and usage.
 - Customize the tray icon background and text colors, theme, notification thresholds, popup details, refresh interval, and Windows startup behavior.
 - Refresh manually or automatically, including after a Bluetooth LE connection or disconnection.
-- Automatically install available updates at startup. Check every 12 hours and notify you when an update is available; you can also check manually from Settings or the tray menu.
+- Install available updates automatically at startup, waiting for unsaved settings to be saved or closed before restarting. Update failures are reported; you can also check manually from Settings or the tray menu.
 
 ## Supported devices
 

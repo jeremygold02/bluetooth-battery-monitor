@@ -45,10 +45,12 @@ internal static class UpdaterTests
             TestAssetVerification(directory);
             TestUpdateDecisions();
             TestReleaseVersionValidation(directory);
+            TestPreparedUpdateCleanup(directory);
             TestReplacement(directory, true);
             TestReplacement(directory, false);
             TestExistingBackup(directory);
             TestConcurrentUpdates(directory);
+            TestRunningInstanceIsNotStopped(directory);
             Console.WriteLine("Updater verification and isolated replacement tests passed.");
         }
         finally
@@ -68,8 +70,8 @@ internal static class UpdaterTests
         UpdateInfo unavailable = new UpdateInfo { UpdateAvailable = true, CanInstall = false };
         UpdateInfo current = new UpdateInfo { UpdateAvailable = false, CanInstall = false };
         Assert(TrayAppContext.DecideUpdateAction(available, TrayAppContext.UpdateCheckMode.Startup) == TrayAppContext.UpdateCheckAction.InstallAutomatically, "startup must install an available verified update");
-        Assert(TrayAppContext.DecideUpdateAction(unavailable, TrayAppContext.UpdateCheckMode.Startup) == TrayAppContext.UpdateCheckAction.Notify, "startup must notify when automatic installation is unavailable");
-        Assert(TrayAppContext.DecideUpdateAction(available, TrayAppContext.UpdateCheckMode.Periodic) == TrayAppContext.UpdateCheckAction.Notify, "periodic checks must notify instead of restarting unexpectedly");
+        Assert(TrayAppContext.DecideUpdateAction(unavailable, TrayAppContext.UpdateCheckMode.Startup) == TrayAppContext.UpdateCheckAction.None, "unavailable automatic installation must remain quiet");
+        Assert(TrayAppContext.DecideUpdateAction(available, TrayAppContext.UpdateCheckMode.Periodic) == TrayAppContext.UpdateCheckAction.None, "periodic checks must remain quiet");
         Assert(TrayAppContext.DecideUpdateAction(available, TrayAppContext.UpdateCheckMode.Manual) == TrayAppContext.UpdateCheckAction.PromptInstall, "manual checks must offer installation");
         Assert(TrayAppContext.DecideUpdateAction(unavailable, TrayAppContext.UpdateCheckMode.Manual) == TrayAppContext.UpdateCheckAction.PromptRelease, "manual checks must offer the release page when installation is unavailable");
         Assert(TrayAppContext.DecideUpdateAction(current, TrayAppContext.UpdateCheckMode.Startup) == TrayAppContext.UpdateCheckAction.None, "the current version must not start installation");
@@ -77,6 +79,28 @@ internal static class UpdaterTests
         Assert(!TrayAppContext.ShouldCheckForStartupUpdate(new string[] { "--skip-startup-update", "--update-failed" }), "updater restart must skip the startup check");
         Assert(TrayAppContext.ShouldCheckForStartupUpdate(new string[] { "--show-settings" }), "ordinary launches must check for updates");
         Assert(TrayAppContext.ShouldCheckForStartupUpdate(null), "launches without arguments must check for updates");
+        int handoffs = 0;
+        Assert(!TrayAppContext.TryHandoffWhenReady(delegate { return false; }, delegate { return true; }, delegate { handoffs++; }),
+            "another running instance must delay restart");
+        Assert(handoffs == 0, "a blocked update must not start its helper");
+        Assert(TrayAppContext.TryHandoffWhenReady(delegate { return false; }, delegate { return false; }, delegate { handoffs++; }) && handoffs == 1,
+            "a safe update must start its helper exactly once");
+    }
+
+    private static void TestPreparedUpdateCleanup(string root)
+    {
+        string directory = Path.Combine(root, "prepared");
+        string jobDir = Path.Combine(directory, "job");
+        Directory.CreateDirectory(jobDir);
+        string staged = Path.Combine(directory, "staged.tmp");
+        string script = Path.Combine(jobDir, "update.ps1");
+        File.WriteAllText(staged, "staged update");
+        File.WriteAllText(script, "not launched");
+        using (UpdateService.PreparedUpdate update = new UpdateService.PreparedUpdate(staged, jobDir, "", script, ""))
+        {
+            Assert(File.Exists(staged) && File.Exists(script), "preparing an update must not start or remove it");
+        }
+        Assert(!File.Exists(staged) && !Directory.Exists(jobDir), "an unstarted update must be cleaned up");
     }
 
     private static void TestAssetVerification(string directory)
@@ -276,6 +300,37 @@ internal static class UpdaterTests
                 Assert(File.Exists(marker), "winning update did not start the app");
                 using (Process winner = Process.GetProcessById(int.Parse(File.ReadAllText(marker))))
                     Assert(!winner.HasExited, "stale update stopped the newly installed app");
+            }
+        }
+        finally { StopFixture(appDir, target); }
+    }
+
+    private static void TestRunningInstanceIsNotStopped(string root)
+    {
+        string caseDir = Path.Combine(root, "running-instance");
+        string appDir = Path.Combine(caseDir, "app");
+        string jobDir = Path.Combine(caseDir, "job");
+        Directory.CreateDirectory(appDir);
+        Directory.CreateDirectory(jobDir);
+        string target = Path.Combine(appDir, "fixture.exe");
+        string staged = Path.Combine(appDir, ".fixture.update.tmp");
+        File.Copy(Assembly.GetExecutingAssembly().Location, target);
+        File.Copy(target, staged);
+        File.WriteAllText(Path.Combine(appDir, "fixture-mode.txt"), "sleep");
+        string originalHash = Hash(target);
+        ProcessStartInfo start = new ProcessStartInfo(target);
+        start.UseShellExecute = false;
+        start.CreateNoWindow = true;
+        try
+        {
+            using (Process instance = Process.Start(start))
+            {
+                string marker = Path.Combine(appDir, "fixture.pid");
+                for (int attempt = 0; attempt < 100 && !File.Exists(marker); attempt++) Thread.Sleep(50);
+                Assert(File.Exists(marker), "test instance did not start");
+                Assert(RunScript(jobDir, target, staged, staged + ".bak") == 1, "a running instance must defer replacement");
+                Assert(!instance.HasExited, "updater force-stopped an existing app instance");
+                Assert(Hash(target) == originalHash, "updater replaced the executable while an instance was running");
             }
         }
         finally { StopFixture(appDir, target); }

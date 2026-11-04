@@ -53,9 +53,26 @@ namespace CodexUsageTray
         private Font bodyFont;
         private Font navigationIconFont;
         private SettingsView settingsView;
+        private AppSettings savedEditableSettings;
+        private bool lastUnsavedChanges;
+        private bool suppressUnsavedChangeEvents;
+        private bool modalSettingsEditInProgress;
 
         public event EventHandler SettingsApplied;
         public event EventHandler UpdateCheckRequested;
+        internal event EventHandler UnsavedChangesChanged;
+
+        internal bool HasUnsavedChanges
+        {
+            get
+            {
+                if (savedEditableSettings == null) return false;
+                if (modalSettingsEditInProgress) return true;
+                if (deviceRadio.Checked && deviceCombo.SelectedItem == null) return true;
+                return !EditableSettingsEqual(savedEditableSettings, CreateSettingsCandidate()) ||
+                    (settingsView != null && settingsView.HasPendingNumericInput());
+            }
+        }
 
         public SettingsForm(AppSettings settings, UsageSnapshot snapshot)
         {
@@ -96,6 +113,8 @@ namespace CodexUsageTray
             ApplyCurrentTheme();
             UpdatePreviews();
             BuildWpfSettingsView();
+            savedEditableSettings = CreateSettingsCandidate();
+            WireUnsavedChangesEvents();
         }
 
         protected override void Dispose(bool disposing)
@@ -886,6 +905,8 @@ namespace CodexUsageTray
                 choices.Add(new DeviceChoice { Id = selectedId, Name = name, Label = name + " (unavailable)" });
             }
 
+            bool wasSuppressingUnsavedChanges = suppressUnsavedChangeEvents;
+            suppressUnsavedChangeEvents = true;
             deviceCombo.BeginUpdate();
             try
             {
@@ -905,8 +926,10 @@ namespace CodexUsageTray
             finally
             {
                 deviceCombo.EndUpdate();
+                suppressUnsavedChangeEvents = wasSuppressingUnsavedChanges;
             }
             if (settingsView != null) settingsView.RefreshDevices();
+            RefreshUnsavedChanges();
         }
 
         private void LoadSettings()
@@ -1015,7 +1038,56 @@ namespace CodexUsageTray
             previewPercentNumeric.ValueChanged += delegate { UpdatePreviews(); };
         }
 
+        private void WireUnsavedChangesEvents()
+        {
+            EventHandler changed = delegate { RefreshUnsavedChanges(); };
+            foreach (CheckBox box in new CheckBox[] { colorBarsCheckBox, showResetTimesCheckBox,
+                showLastUpdatedCheckBox, showResetAvailabilityCheckBox, startWithWindowsCheckBox,
+                thresholdNotificationsCheckBox, showTrayBoxCheckBox }) box.CheckedChanged += changed;
+            foreach (RadioButton radio in new RadioButton[] { weeklyRadio, fiveHourRadio, deviceRadio })
+                radio.CheckedChanged += changed;
+            foreach (NumericUpDown number in new NumericUpDown[] { criticalNumeric, lowNumeric, refreshNumeric, idleRefreshNumeric })
+                number.ValueChanged += changed;
+            deviceCombo.SelectedIndexChanged += changed;
+            themeCombo.SelectedIndexChanged += changed;
+        }
+
+        private void RefreshUnsavedChanges()
+        {
+            if (savedEditableSettings == null || adjustingValues || suppressUnsavedChangeEvents) return;
+            bool dirty = HasUnsavedChanges;
+            if (dirty == lastUnsavedChanges) return;
+            lastUnsavedChanges = dirty;
+            if (UnsavedChangesChanged != null) UnsavedChangesChanged(this, EventArgs.Empty);
+        }
+
+        private static bool EditableSettingsEqual(AppSettings first, AppSettings second)
+        {
+            return first.CriticalThreshold == second.CriticalThreshold &&
+                first.LowThreshold == second.LowThreshold &&
+                string.Equals(first.IconMetric, second.IconMetric, StringComparison.OrdinalIgnoreCase) &&
+                (!string.Equals(first.IconMetric, AppSettings.IconMetricDevice, StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(first.IconDeviceId, second.IconDeviceId, StringComparison.OrdinalIgnoreCase)) &&
+                first.ColorBars == second.ColorBars && first.ShowPopupResetTimes == second.ShowPopupResetTimes &&
+                first.ShowPopupLastUpdated == second.ShowPopupLastUpdated &&
+                first.ShowResetAvailability == second.ShowResetAvailability &&
+                first.StartWithWindows == second.StartWithWindows &&
+                first.ThresholdNotifications == second.ThresholdNotifications &&
+                first.ShowTrayBox == second.ShowTrayBox &&
+                first.UseCustomTrayBoxColor == second.UseCustomTrayBoxColor &&
+                (!first.UseCustomTrayBoxColor ||
+                    string.Equals(first.TrayBoxColor, second.TrayBoxColor, StringComparison.OrdinalIgnoreCase)) &&
+                string.Equals(first.TrayTextColor, second.TrayTextColor, StringComparison.OrdinalIgnoreCase) &&
+                first.RefreshSeconds == second.RefreshSeconds && first.IdleRefreshSeconds == second.IdleRefreshSeconds &&
+                string.Equals(first.Theme, second.Theme, StringComparison.OrdinalIgnoreCase);
+        }
+
         private bool TryApplyToSettings()
+        {
+            return TryApplyToSettingsUsing(delegate(AppSettings candidate) { candidate.Save(); });
+        }
+
+        internal bool TryApplyToSettingsUsing(Action<AppSettings> saveCandidate)
         {
             if (settings.IsSaveBlockedByNewerVersion)
             {
@@ -1040,7 +1112,7 @@ namespace CodexUsageTray
 
             try
             {
-                candidate.Save();
+                saveCandidate(candidate);
             }
             catch (Exception ex)
             {
@@ -1060,6 +1132,9 @@ namespace CodexUsageTray
                 SettingsApplied(this, EventArgs.Empty);
             }
 
+            savedEditableSettings = CreateSettingsCandidate();
+            RefreshUnsavedChanges();
+
             return true;
         }
 
@@ -1071,7 +1146,7 @@ namespace CodexUsageTray
             candidate.LowThreshold = (int)lowNumeric.Value;
             candidate.IconMetric = deviceRadio.Checked ? AppSettings.IconMetricDevice :
                 (fiveHourRadio.Checked ? AppSettings.IconMetricFiveHour : AppSettings.IconMetricWeekly);
-            if (deviceRadio.Checked)
+            if (deviceRadio.Checked && selectedDevice != null)
             {
                 candidate.IconDeviceId = selectedDevice.Id;
                 candidate.IconDeviceName = selectedDevice.Name;
@@ -1121,6 +1196,7 @@ namespace CodexUsageTray
             ApplyCurrentTheme();
             UpdatePreviews();
             if (settingsView != null) settingsView.RefreshFromOwner();
+            RefreshUnsavedChanges();
         }
 
         public void SetUpdateButtonState(bool busy, string busyText)
@@ -1171,19 +1247,30 @@ namespace CodexUsageTray
 
         private bool TryPickColor(Color currentColor, out Color selectedColor)
         {
-            using (ColorDialog dialog = new ColorDialog())
+            SetModalSettingsEditInProgress(true);
+            try
             {
-                dialog.FullOpen = true;
-                dialog.Color = currentColor;
-                if (dialog.ShowDialog(this) == DialogResult.OK)
+                using (ColorDialog dialog = new ColorDialog())
                 {
-                    selectedColor = dialog.Color;
-                    return true;
+                    dialog.FullOpen = true;
+                    dialog.Color = currentColor;
+                    if (dialog.ShowDialog(this) == DialogResult.OK)
+                    {
+                        selectedColor = dialog.Color;
+                        return true;
+                    }
                 }
-            }
 
-            selectedColor = currentColor;
-            return false;
+                selectedColor = currentColor;
+                return false;
+            }
+            finally { SetModalSettingsEditInProgress(false); }
+        }
+
+        private void SetModalSettingsEditInProgress(bool value)
+        {
+            modalSettingsEditInProgress = value;
+            RefreshUnsavedChanges();
         }
 
         private void EnsureValidValues()
@@ -1264,6 +1351,7 @@ namespace CodexUsageTray
 
             UpdateContrastGuidance(effectiveBackground);
             if (settingsView != null) settingsView.RefreshPreview();
+            RefreshUnsavedChanges();
         }
 
         private AppSettings CreatePreviewSettings()
