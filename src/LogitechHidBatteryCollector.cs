@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
+using System.IO;
 using System.Text;
 
 namespace CodexUsageTray
@@ -121,7 +123,26 @@ namespace CodexUsageTray
                 percent = ReadBattery(exchange, deviceIndex, BatteryStatusFeature, 0x00, out batteryStatus, ref responded);
             }
 
-            string name = ReadDeviceName(exchange, deviceIndex, ref responded);
+            string name;
+            try
+            {
+                name = ReadDeviceName(exchange, deviceIndex, ref responded);
+            }
+            catch (Win32Exception)
+            {
+                if (!percent.HasValue) throw;
+                name = null;
+            }
+            catch (IOException)
+            {
+                if (!percent.HasValue) throw;
+                name = null;
+            }
+            catch (TimeoutException)
+            {
+                if (!percent.HasValue) throw;
+                name = null;
+            }
             BatteryProbeResult result = new BatteryProbeResult();
             result.Id = CreateId(receiver, deviceIndex);
             result.Name = string.IsNullOrWhiteSpace(name) ? "Logitech wireless device" : name;

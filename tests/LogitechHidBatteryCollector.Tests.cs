@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
+using System.IO;
 using System.Text;
 using CodexUsageTray;
 
@@ -10,6 +12,8 @@ internal static class LogitechHidBatteryCollectorTests
         TestInterfaceSelection();
         TestX3SparseSlotsAndFallback();
         TestX3UnsupportedUnifiedFeatureFallsBack();
+        TestOptionalNameErrorsPreserveValidBattery();
+        TestNameErrorsWithoutBatteryAndUnexpectedErrorsPropagate();
         TestX3NoResponseHasNoGhost();
         TestResultsSurviveLaterInterfaceError();
         TestLegacyReceiverStillStopsAtFirstTimeout();
@@ -119,6 +123,53 @@ internal static class LogitechHidBatteryCollectorTests
         }
         catch (InvalidOperationException) { failed = true; }
         Assert(failed && found.Count == 1 && found[0].Percent == 61, "a later interface failure must not discard an earlier device");
+    }
+
+    private static void TestOptionalNameErrorsPreserveValidBattery()
+    {
+        Exception[] errors = { new IOException("read failed"), new Win32Exception(5), new TimeoutException("write timed out") };
+        foreach (Exception error in errors)
+        {
+            List<BatteryProbeResult> found = ReadTestDevices(Device(0x046D, 0xC54F, 0xFF43, 0x0302, 20, 20),
+                delegate(byte[] request, Func<byte[], bool> match, int timeout, bool fallback)
+                {
+                    if (request[1] != 1) return null;
+                    if (request[2] == 0 && request[4] == 0x10 && request[5] == 0x04) return Reply(request, match, 4, 0, 0);
+                    if (request[2] == 4) return Reply(request, match, 61, 0, 1);
+                    if (request[2] == 0 && request[4] == 0 && request[5] == 5) throw error;
+                    throw new Exception("unexpected request");
+                });
+            Assert(found.Count == 1 && found[0].Percent == 61 && found[0].Status == "Charging" &&
+                found[0].Name == "Logitech wireless device", "an optional name I/O failure must preserve the battery reading");
+        }
+    }
+
+    private static void TestNameErrorsWithoutBatteryAndUnexpectedErrorsPropagate()
+    {
+        foreach (bool validBattery in new bool[] { false, true })
+        {
+            bool threw = false;
+            try
+            {
+                ReadTestDevices(Device(0x046D, 0xC54F, 0xFF43, 0x0302, 20, 20),
+                    delegate(byte[] request, Func<byte[], bool> match, int timeout, bool fallback)
+                    {
+                        if (request[1] != 1) return null;
+                        if (request[2] == 0 && request[4] == 0x10 && request[5] == 0x04) return Reply(request, match, validBattery ? (byte)4 : (byte)0, 0, 0);
+                        if (request[2] == 4) return Reply(request, match, 61, 0, 0);
+                        if (request[2] == 0 && request[4] == 0x10 && request[5] == 0) return Reply(request, match, 0, 0, 0);
+                        if (request[2] == 0 && request[4] == 0 && request[5] == 5)
+                        {
+                            if (validBattery) throw new InvalidOperationException("unexpected failure");
+                            throw new IOException("read failed");
+                        }
+                        throw new Exception("unexpected request");
+                    });
+            }
+            catch (IOException) { threw = !validBattery; }
+            catch (InvalidOperationException) { threw = validBattery; }
+            Assert(threw, "only expected optional-name I/O failures after a valid battery response may be ignored");
+        }
     }
 
     private static void TestLegacyReceiverStillStopsAtFirstTimeout()
