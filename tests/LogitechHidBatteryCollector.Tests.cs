@@ -10,6 +10,7 @@ internal static class LogitechHidBatteryCollectorTests
     private static void Main()
     {
         TestInterfaceSelection();
+        TestWiredSuperlightDoesNotScanReceiverSlots();
         TestX3SparseSlotsAndFallback();
         TestX3UnsupportedUnifiedFeatureFallsBack();
         TestOptionalNameErrorsPreserveValidBattery();
@@ -19,6 +20,35 @@ internal static class LogitechHidBatteryCollectorTests
         TestLegacyReceiverStillStopsAtFirstTimeout();
         TestLegacyReceiverSuccessAndFeatureOrder();
         Console.WriteLine("Logitech HID++ collector tests passed.");
+    }
+
+    private static void TestWiredSuperlightDoesNotScanReceiverSlots()
+    {
+        List<byte> slots = new List<byte>();
+        List<BatteryProbeResult> found = ReadTestDevices(
+            Device(0x046D, 0xC09F, 0xFF00, 0x0002, 20, 20),
+            delegate(byte[] request, Func<byte[], bool> match, int timeout, bool fallback)
+            {
+                slots.Add(request[1]);
+                if (request[2] == 0 && request[4] == 0x10 && request[5] == 0x00) return Reply(request, match, 0, 0, 0);
+                if (request[2] == 0 && request[4] == 0x10 && request[5] == 0x04) return Reply(request, match, 4, 0, 0);
+                if (request[2] == 4) return Reply(request, match, 85, 0, 1);
+                if (request[2] == 0 && request[4] == 0 && request[5] == 5) return Reply(request, match, 0, 0, 0);
+                if (request[2] == 0 && request[4] == 0 && request[5] == 3) return Reply(request, match, 7, 0, 1);
+                if (request[2] == 7)
+                {
+                    byte[] response = Reply(request, match, 1, 0x12, 0x34);
+                    response[7] = 0x56; response[8] = 0x78;
+                    response[11] = 0xC0; response[12] = 0x9F;
+                    return response;
+                }
+                throw new Exception("unexpected request");
+            });
+        Assert(found.Count == 1 && found[0].Percent == 85 && found[0].Status == "Charging",
+            "wired mouse must produce one charging result");
+        Assert(found[0].PhysicalId == "logitech-unit:C09F0000000012345678", "unit and model identify the physical mouse");
+        Assert(slots.TrueForAll(delegate(byte slot) { return slot == 1; }),
+            "wired mouse must not be queried as six receiver slots");
     }
 
     private static void TestInterfaceSelection()

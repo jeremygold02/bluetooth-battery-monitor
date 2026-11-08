@@ -46,6 +46,49 @@ internal static class BatteryMonitorClientTests
         Assert(!fresh.IsCached && fresh.Percent == 35, "fresh readings replace stale values");
         Assert(BatteryMonitorClient.TryGetUpdatedBatteryCache(0, out revision, out saved) && saved[0].Percent == 35,
             "changed live readings trigger persistence");
+        BatteryProbeResult charged = Find(Run(Device("identity-a", "Same model", "Logitech", 100)), "identity-a");
+        Assert(!charged.IsCached && charged.Percent == 100, "a higher live reading replaces a lower cached reading");
+        Assert(BatteryMonitorClient.TryGetUpdatedBatteryCache(revision, out revision, out saved) && saved[0].Percent == 100,
+            "a higher live reading is persisted");
+        BatteryProbeResult missingAfterCharge = Find(Run(Device("identity-a", "Same model", "Logitech", null)), "identity-a");
+        Assert(missingAfterCharge.IsCached && missingAfterCharge.Percent == 100,
+            "an unavailable device retains its most recent reading after charging");
+
+        string wiredPath = "logitech:fixture-vid_046d&pid_c09f:";
+        DateTime observation = DateTime.Now.AddMinutes(-1);
+        BatteryMonitorClient.InitializeBatteryCache(new List<CachedBatteryReading>
+        {
+            new CachedBatteryReading { Id = wiredPath + "1", Name = "Mouse", Source = "Logitech LIGHTSPEED", Percent = 85, ObservedAt = observation },
+            new CachedBatteryReading { Id = wiredPath + "2", Name = "Mouse", Source = "Logitech LIGHTSPEED", Percent = 85, ObservedAt = observation },
+            new CachedBatteryReading { Id = "logitech:fixture-vid_046d&pid_c54d:2", Name = "Other", Source = "Logitech LIGHTSPEED", Percent = 70, ObservedAt = observation }
+        });
+        List<BatteryProbeResult> migrated = Run();
+        Assert(migrated.Count == 2 && Find(migrated, wiredPath + "1").Percent == 85,
+            "obsolete wired slot copies are discarded while real receiver slots are retained");
+        Assert(BatteryMonitorClient.TryGetUpdatedBatteryCache(0, out revision, out saved) && saved.Count == 2,
+            "removal of obsolete wired slot copies is persisted");
+        BatteryProbeResult unavailable = Device(wiredPath + "1", "Logitech wireless device", "Logitech LIGHTSPEED", null);
+        Assert(Find(Run(unavailable), wiredPath + "1").Name == "Mouse", "sleeping generic result retains its cached device name");
+
+        BatteryMonitorClient.InitializeBatteryCache(null);
+        BatteryProbeResult wired = Device(wiredPath + "1", "Mouse", "Logitech LIGHTSPEED", 85);
+        wired.PhysicalId = "logitech-unit:C09F0000000012345678";
+        BatteryProbeResult wireless = Device("logitech:fixture-vid_046d&pid_c54d:1", "Mouse", "Logitech LIGHTSPEED", 85);
+        wireless.PhysicalId = wired.PhysicalId;
+        Assert(Run(wired, wireless).Count == 1, "two transports with the same physical identity produce one row");
+        wired.Status = "Charging";
+        wireless.Status = "Discharging";
+        List<BatteryProbeResult> bothLive = Run(wireless, wired);
+        Assert(bothLive.Count == 1 && bothLive[0].Status == "Charging", "a live charging transport wins over a discharging alias");
+        Assert(Run(wired).Count == 1, "a cached transport with the same physical identity does not add a row");
+        Assert(BatteryMonitorClient.TryGetUpdatedBatteryCache(0, out revision, out saved) && saved.Count == 2 &&
+            saved.TrueForAll(delegate(CachedBatteryReading item) { return item.PhysicalId == wired.PhysicalId; }),
+            "physical identities persist for both transport paths");
+        BatteryMonitorClient.InitializeBatteryCache(saved);
+        Assert(Run().Count == 1, "physical identity still deduplicates both cached transports after restart");
+        wireless.PhysicalId = "logitech-unit:C09F0000000012345679";
+        BatteryMonitorClient.InitializeBatteryCache(null);
+        Assert(Run(wired, wireless).Count == 2, "distinct same-model physical mice remain separate");
         BatteryRateTracker tracker = new BatteryRateTracker();
         tracker.Update(new List<BatteryProbeResult> { afterRestart[0] }, 1);
         Assert(afterRestart[0].BatteryEstimate == null && tracker.HistoryRevision == 0,

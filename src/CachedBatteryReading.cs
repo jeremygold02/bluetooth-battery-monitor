@@ -5,6 +5,7 @@ namespace CodexUsageTray
     internal sealed class CachedBatteryReading
     {
         public string Id { get; set; }
+        public string PhysicalId { get; set; }
         public string Name { get; set; }
         public string Source { get; set; }
         public int Percent { get; set; }

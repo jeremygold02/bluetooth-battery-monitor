@@ -10,21 +10,49 @@ internal static class BatteryRateTrackerTests
         CultureInfo.CurrentCulture = CultureInfo.InvariantCulture;
         TestQualificationAndNoDoubleCounting();
         TestRestartAndDirectionalSafety();
+        TestPhysicalIdentityAcrossConnections();
         TestRollingAverage();
         TestInterruptionsAndUnstableIdentity();
+        TestBriefCachedAndMissingGaps();
+        TestLongGapExpiresFromLastLiveObservation();
+        TestFullAndErrorStatusesResetLiveSegments();
         TestImportValidationAndCopies();
         Console.WriteLine("Battery rate tests passed.");
+    }
+
+    private static void TestPhysicalIdentityAcrossConnections()
+    {
+        BatteryRateTracker tracker = new BatteryRateTracker();
+        BatteryProbeResult wireless = Device("receiver-slot", 90, "Discharging");
+        wireless.PhysicalId = "logitech-unit:C09F0000000012345678";
+        Check(tracker, wireless, 0, null);
+        wireless.Percent = 88;
+        Check(tracker, wireless, 900, null);
+        BatteryProbeResult wired = Device("wired-device", 87, "Discharging");
+        wired.PhysicalId = wireless.PhysicalId;
+        tracker.Update(new[] { wired }, 1800);
+        Assert(tracker.HistoryRevision == 1 && tracker.ExportHistory()[0].DeviceId == wireless.PhysicalId,
+            "the same physical mouse retains its learning segment across connection paths");
+        BatteryRateTracker restarted = new BatteryRateTracker();
+        restarted.ImportHistory(tracker.ExportHistory());
+        Check(restarted, wireless, 2000, "Avg. \u22126%/h \u00b7 ~14h 40m remaining");
+        BatteryRateTracker upgraded = new BatteryRateTracker();
+        upgraded.ImportHistory(new[] { History("receiver-slot", 0, 0, 6, 3600) });
+        Check(upgraded, wireless, 0, "Avg. \u22126%/h \u00b7 ~14h 40m remaining");
+        Assert(upgraded.HistoryRevision == 1 && upgraded.ExportHistory().Count == 1 &&
+            upgraded.ExportHistory()[0].DeviceId == wireless.PhysicalId,
+            "existing history migrates from the observed path to the physical identity");
     }
 
     private static void TestQualificationAndNoDoubleCounting()
     {
         BatteryRateTracker tracker = new BatteryRateTracker();
         BatteryProbeResult mouse = Device("mouse", 50, "Discharging");
-        Check(tracker, mouse, 0, "Learning battery rate");
+        Check(tracker, mouse, 0, null);
         mouse.Percent = 48;
-        Check(tracker, mouse, 900, "Learning battery rate");
+        Check(tracker, mouse, 900, null);
         mouse.Percent = 47;
-        Check(tracker, mouse, 1799, "Learning battery rate");
+        Check(tracker, mouse, 1799, null);
         Assert(tracker.HistoryRevision == 0 && tracker.ExportHistory().Count == 0,
             "unqualified observations are not saved");
         Check(tracker, mouse, 1800, "Est. \u22126%/h \u00b7 ~7h 50m remaining");
@@ -49,9 +77,9 @@ internal static class BatteryRateTrackerTests
 
         BatteryRateTracker tooFew = new BatteryRateTracker();
         BatteryProbeResult slowPoll = Device("slow-poll", 60, "Discharging");
-        Check(tooFew, slowPoll, 0, "Learning battery rate");
+        Check(tooFew, slowPoll, 0, null);
         slowPoll.Percent = 57;
-        Check(tooFew, slowPoll, 1800, "Learning battery rate");
+        Check(tooFew, slowPoll, 1800, null);
         Assert(tooFew.HistoryRevision == 0, "thirty minutes and three percent still need three readings");
         Check(tooFew, slowPoll, 1801, "Est. \u22126%/h \u00b7 ~9h 30m remaining");
         Assert(tooFew.HistoryRevision == 1, "the third reading qualifies the elapsed segment");
@@ -89,20 +117,20 @@ internal static class BatteryRateTrackerTests
         BatteryRateTracker separate = new BatteryRateTracker();
         separate.ImportHistory(new[] { History("one-way", 0, 0, 6, 3600) });
         BatteryProbeResult other = Device("one-way", 60, "Charging");
-        Check(separate, other, 0, "Learning battery rate");
+        Check(separate, other, 0, null);
         other.Status = "Connected";
         Check(separate, other, 60, "Avg. use \u22126%/h");
         other.Percent = 61;
-        Check(separate, other, 120, "Learning battery rate");
+        Check(separate, other, 120, null);
         Assert(separate.HistoryRevision == 0, "wrong-direction samples do not create history");
 
         device = Device("headset", 60, "Not charging");
         tracker.Reset();
         Check(tracker, device, 600, "Avg. use \u22126%/h");
         device.Percent = 61;
-        Check(tracker, device, 1200, "Learning battery rate");
+        Check(tracker, device, 1200, null);
         device.Percent = 63;
-        Check(tracker, device, 2400, "Learning battery rate");
+        Check(tracker, device, 2400, null);
         Assert(tracker.HistoryRevision == 0, "a rise reported as not charging is not learned as charging");
     }
 
@@ -145,27 +173,29 @@ internal static class BatteryRateTrackerTests
     {
         BatteryRateTracker tracker = new BatteryRateTracker();
         BatteryProbeResult mouse = Device("mouse", 60, "Discharging");
-        Check(tracker, mouse, 0, "Learning battery rate");
+        Check(tracker, mouse, 0, null);
         mouse.Percent = 58;
-        Check(tracker, mouse, 900, "Learning battery rate");
+        Check(tracker, mouse, 900, null);
         mouse.IsCached = true;
         Check(tracker, mouse, 1200, null);
         mouse.IsCached = false;
         mouse.Percent = 57;
-        Check(tracker, mouse, 1800, "Learning battery rate");
-        Assert(tracker.HistoryRevision == 0, "cached observations break an unqualified segment");
+        Check(tracker, mouse, 1800, "Est. \u22126%/h \u00b7 ~9h 30m remaining");
+        Assert(tracker.HistoryRevision == 1,
+            "the third live observation qualifies despite a brief cached reading");
         tracker.Update(new BatteryProbeResult[0], 2400);
-        Check(tracker, mouse, 2700, "Learning battery rate");
-        Check(tracker, mouse, 10000, "Learning battery rate");
+        Check(tracker, mouse, 2700, "Avg. \u22126%/h \u00b7 ~9h 30m remaining");
+        Check(tracker, mouse, 10000, "Avg. \u22126%/h \u00b7 ~9h 30m remaining");
         mouse.Percent = 58;
-        Check(tracker, mouse, 10060, "Learning battery rate");
-        Assert(tracker.HistoryRevision == 0, "absence, long gap, and contradictory direction do not create history");
+        Check(tracker, mouse, 10060, null);
+        Assert(tracker.HistoryRevision == 1 && tracker.ExportHistory()[0].DischargeSamples.Count == 1,
+            "absence, a long gap, and contradictory direction do not add duplicate history");
 
         BatteryRateTracker generated = new BatteryRateTracker();
         BatteryProbeResult temporary = Device("device:" + Guid.NewGuid().ToString("N"), 50, "Discharging");
-        Check(generated, temporary, 0, "Learning battery rate");
+        Check(generated, temporary, 0, null);
         temporary.Percent = 48;
-        Check(generated, temporary, 900, "Learning battery rate");
+        Check(generated, temporary, 900, null);
         temporary.Percent = 47;
         Check(generated, temporary, 1800, "Est. \u22126%/h \u00b7 ~7h 50m remaining");
         Assert(generated.ExportHistory().Count == 0 && generated.HistoryRevision == 0,
@@ -178,6 +208,80 @@ internal static class BatteryRateTrackerTests
         Check(saved, Device("mouse", 50, "Discharging"), 0, "Avg. \u22126%/h \u00b7 ~8h 20m remaining");
         Assert(saved.HistoryRevision == revision && saved.ExportHistory().Count == 1,
             "resume resets live observations but keeps learned history");
+    }
+
+    private static void TestBriefCachedAndMissingGaps()
+    {
+        BatteryRateTracker tracker = new BatteryRateTracker();
+        BatteryProbeResult mouse = Device("brief-gap", 60, "Discharging");
+        Check(tracker, mouse, 0, null);
+
+        mouse.Percent = 55;
+        mouse.IsCached = true;
+        Check(tracker, mouse, 600, null);
+        Assert(tracker.HistoryRevision == 0 && tracker.ExportHistory().Count == 0,
+            "cached percentage changes never create learned history");
+
+        tracker.Update(new BatteryProbeResult[0], 1200);
+        mouse.IsCached = false;
+        mouse.Percent = 58;
+        Check(tracker, mouse, 1800, null);
+        Assert(tracker.HistoryRevision == 0,
+            "cached and missing observations do not count toward the live sample minimum");
+
+        mouse.Percent = 57;
+        tracker.Update(new List<BatteryProbeResult> { mouse }, 3600);
+        List<LearnedBatteryRate> history = tracker.ExportHistory();
+        Assert(mouse.BatteryEstimate.StartsWith("Est. \u22123%/h", StringComparison.Ordinal) &&
+            tracker.HistoryRevision == 1 && history.Count == 1 &&
+            history[0].DischargeSamples.Count == 1 && history[0].DischargeSamples[0].Percent == 3 &&
+            history[0].DischargeSamples[0].Seconds == 3600,
+            "live readings resume a brief gap using only live percentages and samples");
+    }
+
+    private static void TestLongGapExpiresFromLastLiveObservation()
+    {
+        BatteryRateTracker tracker = new BatteryRateTracker();
+        BatteryProbeResult mouse = Device("long-gap", 60, "Discharging");
+        Check(tracker, mouse, 0, null);
+
+        mouse.Percent = 50;
+        mouse.IsCached = true;
+        Check(tracker, mouse, 7200, null);
+        tracker.Update(new BatteryProbeResult[0], 7201);
+        Assert(tracker.HistoryRevision == 0 && tracker.ExportHistory().Count == 0,
+            "cached observations cannot extend a live segment beyond the two-hour limit");
+
+        mouse.IsCached = false;
+        mouse.Percent = 57;
+        Check(tracker, mouse, 7210, null);
+        mouse.Percent = 56;
+        Check(tracker, mouse, 7810, null);
+        Assert(tracker.HistoryRevision == 0,
+            "a device reappearing after an expired gap starts a fresh segment");
+    }
+
+    private static void TestFullAndErrorStatusesResetLiveSegments()
+    {
+        string[] terminalStatuses = { "Fully charged", "Battery error", "Temperature warning", "Charging error" };
+        foreach (string status in terminalStatuses)
+        {
+            BatteryRateTracker tracker = new BatteryRateTracker();
+            BatteryProbeResult device = Device("terminal-state", 60, "Discharging");
+            Check(tracker, device, 0, null);
+
+            device.Status = status;
+            device.Percent = string.Equals(status, "Fully charged", StringComparison.Ordinal) ? 100 : (int?)null;
+            Check(tracker, device, 600, null);
+
+            device.Status = "Discharging";
+            device.Percent = 57;
+            Check(tracker, device, 1200, null);
+            device.Percent = 56;
+            Check(tracker, device, 1800, null);
+            Assert(tracker.HistoryRevision == 0 && tracker.ExportHistory().Count == 0,
+                "full and error states clear the live segment before reappearance");
+        }
     }
 
     private static void TestImportValidationAndCopies()

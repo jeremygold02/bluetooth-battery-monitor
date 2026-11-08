@@ -155,6 +155,11 @@ namespace CodexUsageTray
                 if (readings == null) return;
                 foreach (CachedBatteryReading reading in readings)
                 {
+                    if (reading != null && LogitechHidBatteryCollector.IsObsoleteSuperlight2cWiredSlot(reading.Id))
+                    {
+                        cacheRevision++;
+                        continue;
+                    }
                     if (reading == null || !IsStableId(reading.Id) || reading.Percent < 0 || reading.Percent > 100 ||
                         string.IsNullOrWhiteSpace(reading.Name) || reading.Name.Length > 512 ||
                         string.IsNullOrWhiteSpace(reading.Source) || reading.Source.Length > 512 ||
@@ -162,6 +167,7 @@ namespace CodexUsageTray
                         reading.ObservedAt.ToUniversalTime() > DateTime.UtcNow.AddDays(1) || CacheById.ContainsKey(reading.Id)) continue;
                     CacheById.Add(reading.Id, new BatteryProbeResult { Id = reading.Id, Name = reading.Name,
                         Source = reading.Source, Percent = reading.Percent, Priority = reading.Priority,
+                        PhysicalId = LogitechHidBatteryCollector.IsPhysicalId(reading.PhysicalId) ? reading.PhysicalId : null,
                         ObservedAt = reading.ObservedAt });
                     LastCacheRevisionById[reading.Id] = reading.ObservedAt;
                     if (CacheById.Count >= MaximumCachedDevices) break;
@@ -185,7 +191,8 @@ namespace CodexUsageTray
                 {
                     if (!reading.Percent.HasValue) continue;
                     readings.Add(new CachedBatteryReading { Id = reading.Id, Name = reading.Name, Source = reading.Source,
-                        Percent = reading.Percent.Value, Priority = reading.Priority, ObservedAt = reading.ObservedAt });
+                        Percent = reading.Percent.Value, Priority = reading.Priority, PhysicalId = reading.PhysicalId,
+                        ObservedAt = reading.ObservedAt });
                 }
                 readings.Sort(delegate(CachedBatteryReading left, CachedBatteryReading right)
                 {
@@ -246,7 +253,10 @@ namespace CodexUsageTray
                             current.Percent = cached.Percent;
                             current.ObservedAt = cached.ObservedAt;
                             current.IsCached = true;
+                            current.PhysicalId = cached.PhysicalId;
                             current.Status = CachedStatus(cached.ObservedAt);
+                            if (string.Equals(current.Name, "Logitech wireless device", StringComparison.OrdinalIgnoreCase) &&
+                                !string.IsNullOrWhiteSpace(cached.Name)) current.Name = cached.Name;
                         }
                     }
                     hydrated.Add(current);
@@ -268,12 +278,18 @@ namespace CodexUsageTray
             for (int index = 0; index < hydrated.Count; index++)
             {
                 BatteryProbeResult candidate = hydrated[index];
-                string key = ambiguousNames.Contains(NormalizeName(candidate.Name))
+                string key = LogitechHidBatteryCollector.IsPhysicalId(candidate.PhysicalId)
+                    ? "physical:" + candidate.PhysicalId
+                    : ambiguousNames.Contains(NormalizeName(candidate.Name))
                     ? "id:" + candidate.Id
                     : GetMergeKey(candidate);
                 BatteryProbeResult existing;
                 if (!merged.TryGetValue(key, out existing) ||
-                    DeviceScore(candidate) > DeviceScore(existing))
+                    DeviceScore(candidate) > DeviceScore(existing) ||
+                    (DeviceScore(candidate) == DeviceScore(existing) &&
+                        LogitechHidBatteryCollector.IsPhysicalId(candidate.PhysicalId) &&
+                        string.Equals(candidate.PhysicalId, existing.PhysicalId, StringComparison.OrdinalIgnoreCase) &&
+                        !candidate.IsCached && IsCharging(candidate.Status) && !IsCharging(existing.Status)))
                 {
                     merged[key] = candidate;
                 }
@@ -324,6 +340,7 @@ namespace CodexUsageTray
             DateTime previousRevision;
             bool revisionDue = !exists || previous.Percent != value.Percent ||
                 !string.Equals(previous.Name, value.Name, StringComparison.Ordinal) ||
+                !string.Equals(previous.PhysicalId, value.PhysicalId, StringComparison.Ordinal) ||
                 !string.Equals(previous.Source, value.Source, StringComparison.Ordinal) || previous.Priority != value.Priority ||
                 !LastCacheRevisionById.TryGetValue(value.Id, out previousRevision) ||
                 value.ObservedAt - previousRevision >= TimeSpan.FromMinutes(15);
@@ -411,6 +428,11 @@ namespace CodexUsageTray
             return (value.Percent.HasValue ? 1000 : 0) +
                 (value.IsCached ? -100 : 0) +
                 value.Priority;
+        }
+
+        private static bool IsCharging(string status)
+        {
+            return !string.IsNullOrEmpty(status) && status.StartsWith("Charging", StringComparison.OrdinalIgnoreCase);
         }
 
         private static int CompareDevices(BatteryProbeResult left, BatteryProbeResult right)

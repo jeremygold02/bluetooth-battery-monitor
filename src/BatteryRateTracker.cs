@@ -77,34 +77,42 @@ namespace CodexUsageTray
                     foreach (BatteryProbeResult device in devices) if (device != null) device.BatteryEstimate = null;
                 return;
             }
-            HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (BatteryProbeResult device in devices)
             {
                 if (device == null) continue;
                 device.BatteryEstimate = null;
                 if (string.IsNullOrWhiteSpace(device.Id)) continue;
-                if (!device.Percent.HasValue || device.Percent.Value < 0 || device.Percent.Value > 100 || device.IsCached)
-                {
-                    readings.Remove(device.Id);
-                    continue;
-                }
-
-                seen.Add(device.Id);
-                int percent = device.Percent.Value;
+                string rateId = LogitechHidBatteryCollector.IsPhysicalId(device.PhysicalId) ? device.PhysicalId : device.Id;
                 int state = GetState(device.Status);
                 if (state == 2)
                 {
-                    readings.Remove(device.Id);
+                    readings.Remove(rateId);
+                    continue;
+                }
+                if (!device.Percent.HasValue || device.Percent.Value < 0 || device.Percent.Value > 100 || device.IsCached)
+                {
                     continue;
                 }
 
+                LearnedBatteryRate legacyHistory;
+                if (!string.Equals(rateId, device.Id, StringComparison.OrdinalIgnoreCase) &&
+                    !history.ContainsKey(rateId) && history.TryGetValue(device.Id, out legacyHistory))
+                {
+                    history.Remove(device.Id);
+                    legacyHistory.DeviceId = rateId;
+                    history.Add(rateId, legacyHistory);
+                    HistoryRevision++;
+                }
+
+                int percent = device.Percent.Value;
+
                 Reading reading;
-                if (!readings.TryGetValue(device.Id, out reading) || state != reading.State ||
+                if (!readings.TryGetValue(rateId, out reading) || state != reading.State ||
                     now <= reading.LastTime || now - reading.LastTime > MaxGapSeconds ||
                     now - reading.StartTime > MaxSegmentSeconds)
                 {
-                    readings[device.Id] = NewReading(percent, state, now);
-                    device.BatteryEstimate = HistoricalEstimate(device.Id, state, 0, percent) ?? "Learning battery rate";
+                    readings[rateId] = NewReading(percent, state, now);
+                    device.BatteryEstimate = HistoricalEstimate(rateId, state, 0, percent);
                     continue;
                 }
 
@@ -112,16 +120,16 @@ namespace CodexUsageTray
                 if (direction != 0 && ((state == 1 && direction < 0) || (state == -1 && direction > 0) ||
                     (direction > 0 && string.Equals(device.Status, "Not charging", StringComparison.OrdinalIgnoreCase))))
                 {
-                    readings[device.Id] = NewReading(percent, state, now);
-                    device.BatteryEstimate = "Learning battery rate";
+                    readings[rateId] = NewReading(percent, state, now);
+                    device.BatteryEstimate = null;
                     continue;
                 }
                 if (direction != 0 && reading.Direction != 0 && reading.Direction != direction)
                 {
                     Reading replacement = NewReading(percent, state, now);
                     replacement.Direction = direction;
-                    readings[device.Id] = replacement;
-                    device.BatteryEstimate = HistoricalEstimate(device.Id, state, direction, percent) ?? "Learning battery rate";
+                    readings[rateId] = replacement;
+                    device.BatteryEstimate = HistoricalEstimate(rateId, state, direction, percent);
                     continue;
                 }
                 if (direction != 0) reading.Direction = direction;
@@ -133,28 +141,29 @@ namespace CodexUsageTray
                 double elapsed = now - reading.StartTime;
                 if (reading.Samples < 3 || elapsed < MinimumPeriodSeconds || Math.Abs(change) < MinimumChangePercent)
                 {
-                    device.BatteryEstimate = HistoricalEstimate(device.Id, state, reading.Direction, percent) ?? "Learning battery rate";
+                    device.BatteryEstimate = HistoricalEstimate(rateId, state, reading.Direction, percent);
                     continue;
                 }
 
                 int qualifiedDirection = Math.Sign(change);
                 double perHour = Math.Abs(change) * 3600.0 / elapsed;
                 LearnedBatteryRate existing;
-                bool hadDirection = history.TryGetValue(device.Id, out existing) &&
+                bool hadDirection = history.TryGetValue(rateId, out existing) &&
                     (qualifiedDirection > 0 ? existing.ChargeSamples.Count > 0 : existing.DischargeSamples.Count > 0);
-                if (RecordSegment(device.Id, qualifiedDirection, Math.Abs(change), elapsed))
+                if (RecordSegment(rateId, qualifiedDirection, Math.Abs(change), elapsed))
                 {
-                    LearnedBatteryRate updated = history[device.Id];
+                    LearnedBatteryRate updated = history[rateId];
                     perHour = AverageRate(qualifiedDirection > 0 ? updated.ChargeSamples : updated.DischargeSamples);
                     Reading next = NewReading(percent, state, now);
                     next.Direction = qualifiedDirection;
-                    readings[device.Id] = next;
+                    readings[rateId] = next;
                 }
                 device.BatteryEstimate = FormatEstimate(hadDirection ? "Avg." : "Est.", qualifiedDirection, perHour, percent, true);
             }
 
             List<string> expired = new List<string>();
-            foreach (string id in readings.Keys) if (!seen.Contains(id)) expired.Add(id);
+            foreach (KeyValuePair<string, Reading> entry in readings)
+                if (now - entry.Value.LastTime > MaxGapSeconds) expired.Add(entry.Key);
             foreach (string id in expired) readings.Remove(id);
         }
 

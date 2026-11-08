@@ -5,6 +5,7 @@ namespace CodexUsageTray
     internal sealed class BatteryProbeResult
     {
         public string Id;
+        public string PhysicalId;
         public string Name;
         public int? Percent;
         public string Source;

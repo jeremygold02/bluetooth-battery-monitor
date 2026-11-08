@@ -12,6 +12,8 @@ namespace CodexUsageTray
         private const ushort HidppUsagePage = 0xFF00;
         private const ushort HidppLongUsage = 0x0002;
         private const ushort X3ReceiverProductId = 0xC54F;
+        private const ushort Superlight2cWiredProductId = 0xC09F;
+        private const ushort Superlight2cReceiverProductId = 0xC54D;
         private const ushort X3UsagePage = 0xFF43;
         private const ushort X3LongUsage = 0x0302;
         private const ushort BatteryStatusFeature = 0x1000;
@@ -76,7 +78,9 @@ namespace CodexUsageTray
         {
             bool x3Receiver = IsX3Receiver(device);
             bool anyResponse = false;
-            for (byte deviceIndex = 1; deviceIndex <= 6; deviceIndex++)
+            // The wired Superlight 2c responds at every receiver slot, even though it is one device.
+            byte lastDeviceIndex = device.ProductId == Superlight2cWiredProductId ? (byte)1 : (byte)6;
+            for (byte deviceIndex = 1; deviceIndex <= lastDeviceIndex; deviceIndex++)
             {
                 bool responded;
                 BatteryProbeResult result = x3Receiver
@@ -206,7 +210,38 @@ namespace CodexUsageTray
                 : "Sleeping or unavailable";
             result.Priority = 30;
             result.ObservedAt = DateTime.Now;
+            if (percent.HasValue && (receiver.ProductId == Superlight2cWiredProductId ||
+                receiver.ProductId == Superlight2cReceiverProductId))
+            {
+                try { result.PhysicalId = ReadPhysicalId(connection, deviceIndex); }
+                catch (Win32Exception) { }
+                catch (IOException) { }
+                catch (TimeoutException) { }
+            }
             return result;
+        }
+
+        private static string ReadPhysicalId(HidExchange connection, byte deviceIndex)
+        {
+            byte[] root = Request(connection, deviceIndex, 0, 0, new byte[] { 0x00, 0x03 });
+            if (root == null || root.Length < 7 || IsProtocolError(root) || root[4] == 0 || root[6] == 0) return null;
+            byte[] info = Request(connection, deviceIndex, root[4], 0, new byte[0]);
+            if (info == null || info.Length < 17 || IsProtocolError(info)) return null;
+            bool hasUnit = false, hasModel = false;
+            for (int i = 5; i <= 8; i++) hasUnit |= info[i] != 0;
+            for (int i = 11; i <= 16; i++) hasModel |= info[i] != 0;
+            if (!hasUnit || !hasModel) return null;
+            return "logitech-unit:" + BitConverter.ToString(info, 11, 6).Replace("-", "") +
+                BitConverter.ToString(info, 5, 4).Replace("-", "");
+        }
+
+        internal static bool IsPhysicalId(string value)
+        {
+            const string prefix = "logitech-unit:";
+            if (value == null || !value.StartsWith(prefix, StringComparison.Ordinal) || value.Length != prefix.Length + 20) return false;
+            for (int i = prefix.Length; i < value.Length; i++)
+                if (!Uri.IsHexDigit(value[i])) return false;
+            return true;
         }
 
         private static int? ReadBattery(
@@ -391,6 +426,15 @@ namespace CodexUsageTray
         private static string CreateId(HidDeviceInfo receiver, byte deviceIndex)
         {
             return "logitech:" + receiver.Path + ":" + deviceIndex.ToString();
+        }
+
+        internal static bool IsObsoleteSuperlight2cWiredSlot(string id)
+        {
+            if (string.IsNullOrEmpty(id) || !id.StartsWith("logitech:", StringComparison.OrdinalIgnoreCase) ||
+                id.IndexOf("vid_046d&pid_c09f", StringComparison.OrdinalIgnoreCase) < 0) return false;
+            int separator = id.LastIndexOf(':');
+            int slot;
+            return separator >= 0 && int.TryParse(id.Substring(separator + 1), out slot) && slot >= 2 && slot <= 6;
         }
 
         private static string FormatBatteryStatus(ushort feature, byte status)

@@ -42,10 +42,10 @@ internal static class PopupUiTests
         snapshot = CreateSnapshot(2);
         snapshot.Devices[0].DetailLeft = "HyperX 2.4 GHz";
         snapshot.Devices[0].DetailRight = "Not charging";
-        snapshot.Devices[0].BatteryEstimate = "Learning battery rate";
+        snapshot.Devices[0].BatteryEstimate = null;
         snapshot.Devices[1].DetailLeft = "Logitech LIGHTSPEED";
         snapshot.Devices[1].DetailRight = "dIsChArGiNg";
-        snapshot.Devices[1].BatteryEstimate = "Learning battery rate";
+        snapshot.Devices[1].BatteryEstimate = "Avg. -1.2%/h";
         view.UpdateSnapshot(snapshot);
         double twoHeight = Arrange(view, 480, 900);
         Check(twoHeight < fourHeight - 100, "popup shrinks when the device count drops from four to two");
@@ -53,7 +53,8 @@ internal static class PopupUiTests
         Check(!HasText(view, "Not charging") && !HasText(view, "dIsChArGiNg"), "passive status badges are hidden case-insensitively");
         Check(AutomationProperties.GetName(Row(view, 0)).Contains("Not charging"), "hidden status remains accessible");
         Check(AutomationProperties.GetName(Row(view, 1)).Contains("Logitech LIGHTSPEED"), "connection source remains accessible");
-        Check(HasText(view, "HyperX 2.4 GHz · Learning battery rate"), "device source and learning rate are both shown");
+        Check(HasText(view, "HyperX 2.4 GHz") && HasText(view, "Logitech LIGHTSPEED · Avg. -1.2%/h") &&
+            !HasText(view, "Learning battery rate"), "only determined battery rates are shown");
         Check(view.DeviceScroll.ScrollableHeight == 0 && Bounds(Row(view, 1), view).Bottom <= Bounds(view.DeviceScroll, view).Bottom + 0.5,
             "both devices and their details fit without scrolling");
         AssertBottomPadding(view, 1);
@@ -64,7 +65,7 @@ internal static class PopupUiTests
             ToolTipService.GetInitialShowDelay(view.SettingsButton) == 0, "tooltips appear immediately");
         Check(HasText(hoverContent, "HyperX Cloud III S Wireless") && HasText(hoverContent, "Battery") && HasText(hoverContent, "47%") &&
             HasText(hoverContent, "Source") && HasText(hoverContent, "HyperX 2.4 GHz") && HasText(hoverContent, "Status") &&
-            HasText(hoverContent, "Not charging") && HasText(hoverContent, "Rate") && HasText(hoverContent, "Learning battery rate"),
+            HasText(hoverContent, "Not charging") && !HasText(hoverContent, "Rate"),
             "hover displays the device name and labeled details");
         if (args.Length > 0) SaveBitmap(RenderVisual(hover, hover.ActualWidth, hover.ActualHeight, 1), Variant(args[0], "-tooltip"));
         AssertBorderPixels(view);
