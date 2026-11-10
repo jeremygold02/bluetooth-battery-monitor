@@ -19,18 +19,77 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
-      - name: Compile Bluetooth Battery Monitor
+      - name: Set up Rust
         shell: pwsh
         run: |
-          & .\build.ps1
-          if (-not (Test-Path -LiteralPath ".\BluetoothBatteryMonitor.exe")) {
-            throw "Build completed without creating BluetoothBatteryMonitor.exe."
-          }
-          if ((Get-Item -LiteralPath ".\BluetoothBatteryMonitor.exe").Length -le 0) {
+          rustup toolchain install stable --profile minimal --no-self-update
+          if ($LASTEXITCODE -ne 0) { throw "Could not install the Rust toolchain." }
+          rustup default stable
+          if ($LASTEXITCODE -ne 0) { throw "Could not select the Rust toolchain." }
+
+      - name: Run tests
+        shell: pwsh
+        run: |
+          cargo test --release --locked
+          if ($LASTEXITCODE -ne 0) { throw "Tests failed." }
+
+      - name: Build app
+        shell: pwsh
+        run: |
+          cargo build --release --locked
+          if ($LASTEXITCODE -ne 0) { throw "Build failed." }
+          if ((Get-Item -LiteralPath "target\release\BluetoothBatteryMonitor.exe").Length -le 0) {
             throw "Build created an empty executable."
           }
-          foreach ($file in @("BluetoothBatteryMonitor.exe.config", "Wpf.Ui.dll", "Wpf.Ui.Abstractions.dll", "System.Memory.dll", "System.Buffers.dll", "System.Numerics.Vectors.dll", "System.Runtime.CompilerServices.Unsafe.dll")) {
-            if (-not (Test-Path -LiteralPath (Join-Path '.\artifacts\build' $file))) {
-              throw "Build is missing required runtime file: $file"
-            }
+
+      - name: Build update bridge
+        shell: pwsh
+        run: |
+          $native = (Resolve-Path "target\release\BluetoothBatteryMonitor.exe").Path
+          dotnet build "bridge\BluetoothBatteryMonitor.csproj" -c Release --nologo --artifacts-path "artifacts\bridge" `
+            "-p:BridgeVersion=99.0.0" "-p:NativeExecutable=$native"
+          if ($LASTEXITCODE -ne 0) { throw "Bridge build failed." }
+
+      - name: Test updating from released versions
+        shell: pwsh
+        run: |
+          .\bridge\tests\run-migration-test.ps1 `
+            -Bridge "artifacts\bridge\bin\BluetoothBatteryMonitor\release\BluetoothBatteryMonitor.exe" `
+            -NativeExecutable "target\release\BluetoothBatteryMonitor.exe" `
+            -Version 99.0.0
+
+      - name: Collect license notices
+        shell: pwsh
+        run: .\tools\collect-licenses.ps1 -Destination "artifacts\build"
+
+      - name: Build Inno Setup installer
+        shell: pwsh
+        run: |
+          $iscc = Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path -LiteralPath $iscc)) {
+            choco install innosetup --no-progress -y
+            if ($LASTEXITCODE -ne 0) { throw "Could not install Inno Setup." }
           }
+          if (-not (Test-Path -LiteralPath $iscc)) { throw "Inno Setup compiler was not found." }
+          & $iscc "/DMyAppVersion=99.0.0" "installer\BluetoothBatteryMonitor.iss"
+          if ($LASTEXITCODE -ne 0) { throw "Installer compilation failed." }
+
+      - name: Smoke test installer and uninstaller
+        shell: pwsh
+        run: |
+          $setup = (Resolve-Path "installer\output\BluetoothBatteryMonitor-Setup.exe").Path
+          $installDir = Join-Path $env:RUNNER_TEMP ("bluetooth-installer-test-" + [guid]::NewGuid().ToString("N"))
+          $install = Start-Process -FilePath $setup -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=`"$installDir`"") -WindowStyle Hidden -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "Installer smoke test failed with exit code $($install.ExitCode)." }
+          $exe = Join-Path $installDir "BluetoothBatteryMonitor.exe"
+          $uninstaller = Join-Path $installDir "unins000.exe"
+          $notices = Join-Path $installDir "THIRD_PARTY_NOTICES.md"
+          if (-not (Test-Path -LiteralPath $exe) -or -not (Test-Path -LiteralPath $uninstaller) -or -not (Test-Path -LiteralPath $notices)) {
+            throw "Installer did not create the application, uninstaller, and notices."
+          }
+          if ((Get-FileHash -LiteralPath $exe).Hash -ne (Get-FileHash -LiteralPath "target\release\BluetoothBatteryMonitor.exe").Hash) {
+            throw "Installer did not install the native app."
+          }
+          $uninstall = Start-Process -FilePath $uninstaller -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -WindowStyle Hidden -Wait -PassThru
+          if ($uninstall.ExitCode -ne 0) { throw "Uninstaller smoke test failed with exit code $($uninstall.ExitCode)." }
+          if (Test-Path -LiteralPath $exe) { throw "Uninstaller did not remove the installed executable." }

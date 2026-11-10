@@ -1,12 +1,18 @@
 # Third-Party Notices
 
+This application is built from open-source Rust crates. The application distribution lists
+every crate at the end of this file and includes the crates' license files under `licenses/`.
+
+## Fonts
+
+The interface library [egui](https://github.com/emilk/egui) embeds fallback fonts: Ubuntu Light
+(Ubuntu Font Licence 1.0), Hack (MIT and Bitstream Vera licenses), Noto Emoji (SIL Open Font
+License 1.1), and emoji-icon-font (MIT). Their license texts are included in the application
+distribution under `licenses/epaint_default_fonts-<version>/fonts/`.
+
+## Protocol references
+
 This project includes protocol compatibility work informed by the following MIT-licensed projects.
-
-## WPF UI
-
-This application uses [WPF UI](https://github.com/lepoco/wpfui). Its MIT license and
-its upstream third-party notices are included in the application distribution under
-`licenses/WPF-UI/`. The upstream notices include terms for the included Fluent icons.
 
 ## HyperHeadset
 

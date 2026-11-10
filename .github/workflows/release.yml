@@ -76,7 +76,52 @@ jobs:
           "version=$next" >> $env:GITHUB_OUTPUT
           "previous_tag=$previousTag" >> $env:GITHUB_OUTPUT
 
-      - name: Bake release version
+      - name: Set up Rust
+        if: steps.release_guard.outputs.skip != 'true'
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          if ($LASTEXITCODE -ne 0) { throw "Could not install the Rust toolchain." }
+          rustup default stable
+          if ($LASTEXITCODE -ne 0) { throw "Could not select the Rust toolchain." }
+
+      - name: Run tests
+        if: steps.release_guard.outputs.skip != 'true'
+        shell: pwsh
+        env:
+          BBM_RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          cargo test --release --locked
+          if ($LASTEXITCODE -ne 0) { throw "Tests failed." }
+
+      - name: Build app
+        if: steps.release_guard.outputs.skip != 'true'
+        shell: pwsh
+        env:
+          BBM_RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          cargo build --release --locked
+          if ($LASTEXITCODE -ne 0) { throw "Build failed." }
+
+      - name: Verify app identity
+        if: steps.release_guard.outputs.skip != 'true'
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $exe = "target\release\BluetoothBatteryMonitor.exe"
+          $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($exe))
+          $identity = "BluetoothBatteryMonitorRust.identity{$($env:GITHUB_REPOSITORY)@$($env:RELEASE_VERSION)}"
+          if ($text.IndexOf($identity, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
+            throw "The app does not carry the update identity $identity."
+          }
+          $productVersion = (Get-Item -LiteralPath $exe).VersionInfo.ProductVersion
+          if ($productVersion -ne $env:RELEASE_VERSION) {
+            throw "The app reports version $productVersion instead of $env:RELEASE_VERSION."
+          }
+          if ($text -match '(?i)vcruntime\d*\.dll') { throw "The app depends on the Visual C++ runtime." }
+
+      - name: Build update bridge
         if: steps.release_guard.outputs.skip != 'true'
         shell: pwsh
         env:
@@ -84,28 +129,26 @@ jobs:
         run: |
           $parts = $env:GITHUB_REPOSITORY.Split("/")
           if ($parts.Count -ne 2) { throw "Unexpected repository format: $env:GITHUB_REPOSITORY" }
-          $source = @(
-            "namespace CodexUsageTray",
-            "{",
-            "    internal static class BuildVersion",
-            "    {",
-            "        public const string Version = `"$env:RELEASE_VERSION`";",
-            "        public const string GitHubOwner = `"$($parts[0])`";",
-            "        public const string GitHubRepo = `"$($parts[1])`";",
-            "    }",
-            "}"
-          ) -join [Environment]::NewLine
-          Set-Content -LiteralPath "src\BuildVersion.cs" -Value $source -Encoding UTF8
+          $native = (Resolve-Path "target\release\BluetoothBatteryMonitor.exe").Path
+          dotnet build "bridge\BluetoothBatteryMonitor.csproj" -c Release --nologo --artifacts-path "artifacts\bridge" `
+            "-p:BridgeVersion=$env:RELEASE_VERSION" "-p:GitHubOwner=$($parts[0])" "-p:GitHubRepo=$($parts[1])" "-p:NativeExecutable=$native"
+          if ($LASTEXITCODE -ne 0) { throw "Bridge build failed." }
 
-      - name: Run tests
+      - name: Test updating from released versions
         if: steps.release_guard.outputs.skip != 'true'
         shell: pwsh
-        run: .\tests\run-tests.ps1
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          .\bridge\tests\run-migration-test.ps1 `
+            -Bridge "artifacts\bridge\bin\BluetoothBatteryMonitor\release\BluetoothBatteryMonitor.exe" `
+            -NativeExecutable "target\release\BluetoothBatteryMonitor.exe" `
+            -Version $env:RELEASE_VERSION
 
-      - name: Build executable
+      - name: Collect license notices
         if: steps.release_guard.outputs.skip != 'true'
         shell: pwsh
-        run: .\build.ps1
+        run: .\tools\collect-licenses.ps1 -Destination "artifacts\build"
 
       - name: Build Inno Setup installer
         if: steps.release_guard.outputs.skip != 'true'
@@ -143,33 +186,7 @@ jobs:
           $settingsAfter = if (Test-Path -LiteralPath $settingsPath) { (Get-FileHash -LiteralPath $settingsPath).Hash } else { $null }
           if ($settingsBefore -ne $settingsAfter) { throw "Installer or uninstaller changed user settings." }
 
-      - name: Validate updater script syntax
-        if: steps.release_guard.outputs.skip != 'true'
-        shell: powershell
-        run: |
-          $tempDir = Join-Path $env:RUNNER_TEMP ("bluetooth-updater-parse-" + [guid]::NewGuid().ToString("N"))
-          New-Item -ItemType Directory -Path $tempDir | Out-Null
-          try {
-            $assembly = [Reflection.Assembly]::LoadFrom((Resolve-Path "BluetoothBatteryMonitor.exe").Path)
-            $type = $assembly.GetType("CodexUsageTray.UpdateService", $true)
-            $method = $type.GetMethod("WriteUpdaterScript", [Reflection.BindingFlags]"Static,NonPublic")
-            $script = [string](Join-Path $tempDir "update.ps1")
-            $staged = [string](Join-Path $tempDir "staged.exe")
-            $target = [string](Join-Path $tempDir "target.exe")
-            $backup = [string](Join-Path $tempDir "target.exe.bak")
-            $method.Invoke($null, [object[]]@($script, $staged, $target, $backup, [int]12345))
-            $tokens = $null
-            $errors = $null
-            [void][Management.Automation.Language.Parser]::ParseFile($script, [ref]$tokens, [ref]$errors)
-            if ($errors.Count -ne 0) {
-              $errors | ForEach-Object { Write-Error $_.Message }
-              throw "Generated updater script has PowerShell syntax errors."
-            }
-          } finally {
-            Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
-          }
-
-      - name: Prepare release notes and notices
+      - name: Prepare release notes and assets
         if: steps.release_guard.outputs.skip != 'true'
         shell: pwsh
         env:
@@ -183,11 +200,15 @@ jobs:
           if ($commits.Count -eq 0) { $commits = @("- No code changes since the previous release.") }
           $notes = @("## Changes", "") + $commits + @(
             "", "## Download", "- ``BluetoothBatteryMonitor-Setup.exe`` installs the Windows tray app.",
-            "- ``BluetoothBatteryMonitor.exe`` is the portable Windows tray app.",
+            "- ``BluetoothBatteryMonitor.exe`` is the portable Windows tray app. On first start it replaces itself with the native app; that step uses .NET Framework 4.8, included with current Windows versions.",
+            "- ``BluetoothBatteryMonitorRust.exe`` is the native app file used by automatic updates.",
             "- ``ThirdPartyNotices.zip`` contains the included third-party license notices."
           )
           Set-Content -LiteralPath "release_notes.md" -Value $notes -Encoding UTF8
-          Compress-Archive -Path "artifacts\build\THIRD_PARTY_NOTICES.md", "artifacts\build\licenses" -DestinationPath "ThirdPartyNotices.zip"
+          New-Item -ItemType Directory -Path "artifacts\release" -Force | Out-Null
+          Copy-Item -LiteralPath "artifacts\bridge\bin\BluetoothBatteryMonitor\release\BluetoothBatteryMonitor.exe" -Destination "artifacts\release\BluetoothBatteryMonitor.exe"
+          Copy-Item -LiteralPath "target\release\BluetoothBatteryMonitor.exe" -Destination "artifacts\release\BluetoothBatteryMonitorRust.exe"
+          Compress-Archive -Path "artifacts\build\THIRD_PARTY_NOTICES.md", "artifacts\build\licenses" -DestinationPath "artifacts\release\ThirdPartyNotices.zip"
 
       - name: Create GitHub release
         if: steps.release_guard.outputs.skip != 'true'
@@ -202,6 +223,7 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or -not [string]::Equals($mainSha.Trim(), $env:GITHUB_SHA, [StringComparison]::OrdinalIgnoreCase)) {
             throw "Main moved while building; a newer run will create the release."
           }
-          gh release create $env:RELEASE_VERSION "BluetoothBatteryMonitor.exe" "installer\output\BluetoothBatteryMonitor-Setup.exe" "ThirdPartyNotices.zip" `
+          gh release create $env:RELEASE_VERSION "artifacts\release\BluetoothBatteryMonitor.exe" "artifacts\release\BluetoothBatteryMonitorRust.exe" `
+            "installer\output\BluetoothBatteryMonitor-Setup.exe" "artifacts\release\ThirdPartyNotices.zip" `
             --title $env:RELEASE_VERSION --notes-file "release_notes.md" --target $env:GITHUB_SHA --latest
           if ($LASTEXITCODE -ne 0) { throw "GitHub release creation failed." }

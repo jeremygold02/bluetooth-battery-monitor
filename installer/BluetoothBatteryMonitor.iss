@@ -36,10 +36,16 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
+[InstallDelete]
+Type: filesandordirs; Name: "{app}\licenses"
+
 [Files]
-Source: "..\BluetoothBatteryMonitor.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\target\release\BluetoothBatteryMonitor.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\artifacts\build\THIRD_PARTY_NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\artifacts\build\licenses\*"; DestDir: "{app}\licenses"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+[UninstallDelete]
+Type: files; Name: "{app}\.{#MyAppExe}.update*"
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"; WorkingDir: "{app}"
