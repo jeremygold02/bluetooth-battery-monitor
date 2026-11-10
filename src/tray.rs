@@ -967,24 +967,23 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "contacts the GitHub releases API"]
-    fn latest_published_release_is_usable_by_the_rust_build() {
-        let folder = std::env::temp_dir().join(format!("bbm-rust-update-check-{}", std::process::id()));
+    #[ignore = "downloads the latest release from GitHub"]
+    fn latest_published_release_downloads_and_verifies() {
+        let folder = std::env::temp_dir().join(format!("bbm-rust-update-download-{}", std::process::id()));
         std::fs::create_dir_all(&folder).unwrap();
-        let updater =
-            Updater::new(updater::build_version(), &folder.join("app.exe"), &folder.join(UPDATE_STATE_FILE));
-        let periodic = updater.periodic_check();
-        let manual = updater.manual_check();
-        println!("periodic: {} / {:?}", periodic.status_text, periodic.notification);
-        println!("manual: {} / {:?} / {}", manual.status_text, manual.action, manual.dialog_text);
+        let target = folder.join("BluetoothBatteryMonitor.exe");
+        std::fs::copy(std::env::current_exe().unwrap(), &target).unwrap();
+        let updater = Updater::new(DEVELOPMENT_VERSION, &target, &folder.join(UPDATE_STATE_FILE));
+        let check = updater.manual_check();
+        let outcome = check.update.as_ref().map(|update| updater.install_update(update, &|| false));
+        let prepared = matches!(outcome, Some(UpdateOutcome::Deferred { .. }));
+        let description = format!("{} / {outcome:?}", check.dialog_text);
+        drop(outcome);
+        let unchanged = std::fs::read(&target).ok() == std::fs::read(std::env::current_exe().unwrap()).ok();
         let _ = std::fs::remove_dir_all(&folder);
-        assert!(!periodic.status_text.starts_with("Update check failed"), "{}", periodic.status_text);
-        assert_eq!(periodic.notification, None);
-        assert!(
-            matches!(manual.action, UpdateCheckAction::None | UpdateCheckAction::PromptInstall),
-            "{}",
-            manual.dialog_text
-        );
+        assert_eq!(check.action, UpdateCheckAction::PromptInstall, "{description}");
+        assert!(prepared, "{description}");
+        assert!(unchanged);
     }
 
     #[test]
