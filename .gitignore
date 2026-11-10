@@ -8,3 +8,11 @@
 
 # Local batch helpers
 *.bat
+
+# Rust build output
+/target/
+/screenshots/
+
+# Bridge build output
+/bridge/**/bin/
+/bridge/**/obj/
