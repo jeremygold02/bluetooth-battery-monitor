@@ -110,8 +110,9 @@ fn cursor() -> PixelPoint {
     PixelPoint { x: point.x, y: point.y }
 }
 
-fn push(event: ShellEvent) {
+fn push(window: HWND, event: ShellEvent) {
     EVENTS.with(|events| events.borrow_mut().push_back(event));
+    unsafe { PostMessageW(window, WM_NULL, 0, 0) };
 }
 
 fn show_menu(window: HWND) {
@@ -138,7 +139,7 @@ fn show_menu(window: HWND) {
         command
     };
     if command > 0 {
-        push(ShellEvent::Command(command as u32, position));
+        push(window, ShellEvent::Command(command as u32, position));
     }
 }
 
@@ -146,7 +147,7 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
     match message {
         TRAY_CALLBACK => {
             match lparam as u32 {
-                WM_LBUTTONUP => push(ShellEvent::Click(cursor())),
+                WM_LBUTTONUP => push(window, ShellEvent::Click(cursor())),
                 WM_RBUTTONUP => show_menu(window),
                 _ => {}
             }
@@ -156,17 +157,17 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
             if wparam == ICON_RETRY_TIMER {
                 add_icon(window);
             } else {
-                push(ShellEvent::Timer(wparam));
+                push(window, ShellEvent::Timer(wparam));
             }
             0
         }
         WAKE => {
-            push(ShellEvent::Wake);
+            push(window, ShellEvent::Wake);
             0
         }
         WM_POWERBROADCAST => {
             if wparam == RESUME_AUTOMATIC || wparam == RESUME_SUSPEND {
-                push(ShellEvent::Resume);
+                push(window, ShellEvent::Resume);
             }
             unsafe { DefWindowProcW(window, message, wparam, lparam) }
         }
@@ -337,5 +338,39 @@ impl Drop for Shell {
         if !icon.is_null() {
             unsafe { DestroyIcon(icon) };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SendNotifyMessageW;
+
+    #[test]
+    fn a_click_delivered_as_a_sent_message_is_handled_at_once() {
+        let (ready, started) = mpsc::channel();
+        let (seen, clicks) = mpsc::channel();
+        let pump = std::thread::spawn(move || {
+            let shell = Shell::create("", &[0; 4], 1, Vec::new()).unwrap();
+            ready.send(shell.window as isize).unwrap();
+            shell.run(|_, event| match event {
+                ShellEvent::Click(_) => {
+                    let _ = seen.send(());
+                    true
+                }
+                ShellEvent::Wake => false,
+                _ => true,
+            });
+        });
+        let window = started.recv_timeout(Duration::from_secs(5)).unwrap() as HWND;
+
+        unsafe { SendNotifyMessageW(window, TRAY_CALLBACK, ICON_ID as WPARAM, WM_LBUTTONUP as LPARAM) };
+        let handled = clicks.recv_timeout(Duration::from_secs(2)).is_ok();
+
+        Waker(window as isize).wake();
+        pump.join().unwrap();
+        assert!(handled);
     }
 }
