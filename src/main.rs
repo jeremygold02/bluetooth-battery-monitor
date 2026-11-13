@@ -3,6 +3,7 @@
 
 mod collect;
 mod devices;
+mod hfp;
 mod icon;
 mod ipc;
 mod monitor;

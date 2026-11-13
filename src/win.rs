@@ -5,7 +5,7 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::System::Threading::{CreateEventW, CreateMutexW, INFINITE, SetEvent, WaitForSingleObject};
 use windows_sys::Win32::Globalization::{
-    DATE_SHORTDATE, GetDateFormatEx, GetLocaleInfoEx, GetTimeFormatEx, LOCALE_SDECIMAL, TIME_NOSECONDS,
+    GetLocaleInfoEx, GetTimeFormatEx, LOCALE_SDECIMAL, TIME_NOSECONDS,
 };
 use windows_sys::Win32::Graphics::Gdi::{
     GetMonitorInfoW, GetSysColor, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint,
@@ -112,24 +112,6 @@ pub fn format_short_time(unix_ms: i64) -> String {
         GetTimeFormatEx(std::ptr::null(), TIME_NOSECONDS, &time, std::ptr::null(), buffer.as_mut_ptr(), buffer.len() as i32)
     };
     if length > 0 { from_wide(&buffer) } else { String::new() }
-}
-
-pub fn format_short_date_time(unix_ms: i64) -> String {
-    let Some(time) = local_time(unix_ms) else { return String::new() };
-    let mut buffer = [0u16; 80];
-    let length = unsafe {
-        GetDateFormatEx(
-            std::ptr::null(),
-            DATE_SHORTDATE,
-            &time,
-            std::ptr::null(),
-            buffer.as_mut_ptr(),
-            buffer.len() as i32,
-            std::ptr::null(),
-        )
-    };
-    let date = if length > 0 { from_wide(&buffer) } else { String::new() };
-    format!("{date} {}", format_short_time(unix_ms)).trim().to_owned()
 }
 
 pub fn decimal_separator() -> String {
@@ -346,8 +328,6 @@ mod tests {
         let time = format_short_time(noon);
         assert!(!time.is_empty());
         assert!(!time.contains(":00:00"));
-        let stamp = format_short_date_time(noon);
-        assert!(stamp.ends_with(&time) && stamp.len() > time.len());
         assert_eq!(format_short_time(i64::MAX), "");
     }
 

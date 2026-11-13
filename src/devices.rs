@@ -1,6 +1,17 @@
 use crate::probe::ProbeResult;
-use hidapi::{HidApi, HidDevice};
+use hidapi::{BusType, HidApi, HidDevice};
 use std::time::{Duration, Instant};
+use windows_sys::Win32::Devices::HumanInterfaceDevice::{
+    HIDP_CAPS, HIDP_REPORT_TYPE, HIDP_STATUS_SUCCESS, HIDP_VALUE_CAPS, HidD_FreePreparsedData,
+    HidD_GetFeature, HidD_GetInputReport, HidD_GetPreparsedData, HidP_Feature, HidP_GetCaps,
+    HidP_GetSpecificValueCaps, HidP_GetUsageValue, HidP_Input, PHIDP_PREPARSED_DATA,
+};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+};
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+};
 
 const LOGITECH_VENDOR: u16 = 0x046d;
 const HIDPP_USAGE_PAGE: u16 = 0xff00;
@@ -26,6 +37,29 @@ const CLOUD_III_S_ALTERNATE: u16 = 0x06be;
 const HYPERX_USAGE_PAGE: u16 = 0x01c0;
 const HYPERX_USAGE: u16 = 0x0001;
 const HYPERX_TIMEOUT: u64 = 1500;
+
+const HID_BATTERY_STRENGTH_PAGE: u16 = 0x0006;
+const HID_BATTERY_STRENGTH_USAGE: u16 = 0x0020;
+const HID_BATTERY_SOURCE: &str = "HID Battery Strength";
+const HID_BATTERY_PRIORITY: i32 = 25;
+const HID_BATTERY_UNAVAILABLE: &str = "No battery data received";
+const MAXIMUM_HID_VALUE_CAPS: u16 = 256;
+
+struct HidHandle(HANDLE);
+
+impl Drop for HidHandle {
+    fn drop(&mut self) {
+        unsafe { CloseHandle(self.0) };
+    }
+}
+
+struct HidPreparsedData(PHIDP_PREPARSED_DATA);
+
+impl Drop for HidPreparsedData {
+    fn drop(&mut self) {
+        unsafe { HidD_FreePreparsedData(self.0) };
+    }
+}
 
 pub trait Exchange {
     fn exchange(
@@ -80,6 +114,186 @@ struct Interface {
     path: String,
     product_id: u16,
     x3_receiver: bool,
+}
+
+pub fn collect_hid_batteries() -> Result<Vec<ProbeResult>, String> {
+    let api = HidApi::new().map_err(|error| error.to_string())?;
+    let mut results = Vec::new();
+    for info in api.device_list() {
+        if !matches!(info.bus_type(), BusType::Bluetooth | BusType::Usb) {
+            continue;
+        }
+        let path = info.path().to_string_lossy();
+        let path_wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+        let handle = unsafe {
+            CreateFileW(
+                path_wide.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            continue;
+        }
+        let handle = HidHandle(handle);
+        let mut raw_preparsed_data: PHIDP_PREPARSED_DATA = 0;
+        if !unsafe { HidD_GetPreparsedData(handle.0, &mut raw_preparsed_data) }
+            || raw_preparsed_data == 0
+        {
+            continue;
+        }
+        let preparsed_data = HidPreparsedData(raw_preparsed_data);
+        let mut capabilities = HIDP_CAPS::default();
+        if unsafe { HidP_GetCaps(preparsed_data.0, &mut capabilities) } != HIDP_STATUS_SUCCESS {
+            continue;
+        }
+
+        let input_caps = hid_battery_value_caps(
+            preparsed_data.0,
+            HidP_Input,
+            capabilities.NumberInputValueCaps,
+        );
+        let feature_caps = hid_battery_value_caps(
+            preparsed_data.0,
+            HidP_Feature,
+            capabilities.NumberFeatureValueCaps,
+        );
+        if input_caps.is_empty() && feature_caps.is_empty() {
+            continue;
+        }
+
+        let percent = read_hid_battery_report(
+            handle.0,
+            preparsed_data.0,
+            HidP_Input,
+            &input_caps,
+            capabilities.InputReportByteLength,
+        )
+        .or_else(|| {
+            read_hid_battery_report(
+                handle.0,
+                preparsed_data.0,
+                HidP_Feature,
+                &feature_caps,
+                capabilities.FeatureReportByteLength,
+            )
+        });
+        let name = info
+            .product_string()
+            .filter(|name| !name.trim().is_empty())
+            .or_else(|| {
+                info.manufacturer_string()
+                    .filter(|name| !name.trim().is_empty())
+            })
+            .unwrap_or("HID battery device")
+            .to_owned();
+        results.push(ProbeResult {
+            id: format!("hid-battery:{path}"),
+            name,
+            percent,
+            source: HID_BATTERY_SOURCE.to_owned(),
+            status: if percent.is_some() {
+                "Connected".to_owned()
+            } else {
+                HID_BATTERY_UNAVAILABLE.to_owned()
+            },
+            priority: HID_BATTERY_PRIORITY,
+            ..Default::default()
+        });
+    }
+    Ok(results)
+}
+
+fn hid_battery_value_caps(
+    preparsed_data: PHIDP_PREPARSED_DATA,
+    report_type: HIDP_REPORT_TYPE,
+    capability_count: u16,
+) -> Vec<HIDP_VALUE_CAPS> {
+    let mut value_caps_length = capability_count.min(MAXIMUM_HID_VALUE_CAPS);
+    if value_caps_length == 0 {
+        return Vec::new();
+    }
+    let mut value_caps = vec![HIDP_VALUE_CAPS::default(); usize::from(value_caps_length)];
+    let status = unsafe {
+        HidP_GetSpecificValueCaps(
+            report_type,
+            HID_BATTERY_STRENGTH_PAGE,
+            0,
+            HID_BATTERY_STRENGTH_USAGE,
+            value_caps.as_mut_ptr(),
+            &mut value_caps_length,
+            preparsed_data,
+        )
+    };
+    if status != HIDP_STATUS_SUCCESS {
+        return Vec::new();
+    }
+    value_caps.truncate(usize::from(value_caps_length));
+    value_caps
+}
+
+fn read_hid_battery_report(
+    handle: HANDLE,
+    preparsed_data: PHIDP_PREPARSED_DATA,
+    report_type: HIDP_REPORT_TYPE,
+    value_caps: &[HIDP_VALUE_CAPS],
+    report_length: u16,
+) -> Option<u8> {
+    if report_length == 0 {
+        return None;
+    }
+    for value_cap in value_caps {
+        let mut report = vec![0u8; usize::from(report_length)];
+        report[0] = value_cap.ReportID;
+        let read = unsafe {
+            if report_type == HidP_Input {
+                HidD_GetInputReport(handle, report.as_mut_ptr().cast(), u32::from(report_length))
+            } else if report_type == HidP_Feature {
+                HidD_GetFeature(handle, report.as_mut_ptr().cast(), u32::from(report_length))
+            } else {
+                false
+            }
+        };
+        if !read {
+            continue;
+        }
+        let mut raw_percent = 0u32;
+        let status = unsafe {
+            HidP_GetUsageValue(
+                report_type,
+                HID_BATTERY_STRENGTH_PAGE,
+                value_cap.LinkCollection,
+                HID_BATTERY_STRENGTH_USAGE,
+                &mut raw_percent,
+                preparsed_data,
+                report.as_ptr(),
+                u32::from(report_length),
+            )
+        };
+        if status == HIDP_STATUS_SUCCESS {
+            if let Some(percent) =
+                hid_battery_percent(raw_percent, value_cap.LogicalMin, value_cap.LogicalMax)
+            {
+                return Some(percent);
+            }
+        }
+    }
+    None
+}
+
+fn hid_battery_percent(raw_value: u32, logical_minimum: i32, logical_maximum: i32) -> Option<u8> {
+    let raw_value = u64::from(raw_value);
+    let logical_minimum = u64::try_from(logical_minimum).ok()?;
+    let logical_maximum = u64::try_from(logical_maximum).ok()?;
+    let range = logical_maximum.checked_sub(logical_minimum)?;
+    if range == 0 || raw_value < logical_minimum || raw_value > logical_maximum {
+        return None;
+    }
+    u8::try_from((raw_value - logical_minimum) * 100 / range).ok()
 }
 
 pub fn collect_logitech(errors: &mut Vec<String>) -> Result<Vec<ProbeResult>, String> {

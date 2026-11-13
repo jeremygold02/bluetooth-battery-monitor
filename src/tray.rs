@@ -1,5 +1,6 @@
 use crate::collect;
 use crate::icon::{ICON_SIZE, IconContent, IconFonts, IconStyle, render};
+use crate::hfp::HfpMonitor;
 use crate::ipc::{self, FromPopup, FromSettings, PopupState, PopupView, SettingsInit, ToSettings, UpdateStatus};
 use crate::monitor::{Device, FetchResult, Monitor};
 use crate::rate::LearnedBatteryRate;
@@ -67,6 +68,7 @@ struct View {
 
 enum WorkerCommand {
     Fetch,
+    SetHfpTrace(bool),
     ResetRates,
     RatesSaved(u64),
     CacheSaved(u64),
@@ -81,6 +83,7 @@ struct FetchOutcome {
 
 enum Incoming {
     Fetched(Box<FetchOutcome>),
+    HfpTraceStatus(Option<String>),
     Popup(u32, FromPopup),
     PopupClosed(u32),
     Settings(u32, FromSettings),
@@ -127,6 +130,7 @@ struct Tray {
     popup_closed_at: Option<Instant>,
     anchor: Option<PixelPoint>,
     settings_window: Option<Window>,
+    hfp_trace_status: Option<String>,
     restart_allowed: Arc<AtomicBool>,
     updater: Option<Arc<Updater>>,
     update_status: String,
@@ -168,12 +172,15 @@ pub fn run(arguments: &[String]) {
 
     let (incoming, inbox) = mpsc::channel::<Incoming>();
     let (commands, worker_commands) = mpsc::channel::<WorkerCommand>();
-    let mut monitor = Monitor::new(&win::decimal_separator(), win::format_short_date_time);
+    let mut monitor = Monitor::new(&win::decimal_separator());
     monitor.initialize_rates(&store.values.learned_battery_rates);
     monitor.initialize_cache(&store.values.cached_battery_readings, win::now_ms());
     let worker_incoming = incoming.clone();
     let worker_waker = shell.waker();
     std::thread::spawn(move || work(monitor, worker_commands, worker_incoming, worker_waker));
+    if store.values.hfp_trace_enabled {
+        let _ = commands.send(WorkerCommand::SetHfpTrace(true));
+    }
 
     let mut tray = Tray {
         settings: store,
@@ -194,6 +201,7 @@ pub fn run(arguments: &[String]) {
         popup_closed_at: None,
         anchor: None,
         settings_window: None,
+        hfp_trace_status: None,
         restart_allowed: Arc::new(AtomicBool::new(true)),
         updater: None,
         update_status: updater::update_complete_status(arguments, updater::build_version()).unwrap_or_default(),
@@ -245,19 +253,47 @@ pub fn run(arguments: &[String]) {
 }
 
 fn work(mut monitor: Monitor, commands: Receiver<WorkerCommand>, incoming: Sender<Incoming>, waker: Waker) {
+    let mut hfp_monitor = None;
     let started = Instant::now();
     let mut saved_rates = 0;
     let mut saved_cache = 0;
     for command in commands {
         match command {
+            WorkerCommand::SetHfpTrace(enabled) => {
+                let status = if enabled {
+                    let hfp_incoming = incoming.clone();
+                    let hfp_waker = waker.clone();
+                    match HfpMonitor::start(move || {
+                        let _ = hfp_incoming.send(Incoming::ConnectionChanged);
+                        hfp_waker.wake();
+                    }) {
+                        Ok(trace) => {
+                            hfp_monitor = Some(trace);
+                            Some("Listening for Hands-Free battery reports.".to_owned())
+                        }
+                        Err(message) => Some(message),
+                    }
+                } else {
+                    hfp_monitor = None;
+                    None
+                };
+                let _ = incoming.send(Incoming::HfpTraceStatus(status));
+                waker.wake();
+            }
             WorkerCommand::ResetRates => monitor.reset_rates(),
             WorkerCommand::RatesSaved(revision) => saved_rates = revision,
             WorkerCommand::CacheSaved(revision) => saved_cache = revision,
             WorkerCommand::Fetch => {
                 let attempted_at = win::now_ms();
-                let collected = std::panic::catch_unwind(collect::collect_all).ok();
+                let collected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    collect::collect_all(hfp_monitor.as_ref())
+                }))
+                .ok();
                 let outcome = match collected {
-                    Some((probes, errors)) => {
+                    Some((probes, errors, trace_error)) => {
+                        if let Some(message) = trace_error {
+                            let _ = incoming.send(Incoming::HfpTraceStatus(Some(message)));
+                        }
                         let result = monitor.fetch(probes, &errors, attempted_at, started.elapsed().as_secs_f64());
                         FetchOutcome {
                             result: Some(result),
@@ -477,6 +513,15 @@ impl Tray {
             Incoming::ExitRequested => return false,
             Incoming::Update(event) => return self.handle_update(shell, *event),
             Incoming::Fetched(outcome) => self.complete_refresh(shell, *outcome),
+            Incoming::HfpTraceStatus(status) => {
+                if self.settings.values.hfp_trace_enabled {
+                    self.hfp_trace_status = status;
+                    if let Some(window) = &mut self.settings_window {
+                        let status = self.hfp_trace_status.clone();
+                        let _ = ipc::write_message(&mut window.input, &ToSettings::HfpTraceStatus(status));
+                    }
+                }
+            }
             Incoming::Popup(id, request) => {
                 if self.popup.as_ref().is_some_and(|popup| popup.process.id() == id) {
                     match request {
@@ -861,6 +906,7 @@ impl Tray {
         let init = SettingsInit {
             settings: editable,
             start_with_windows: startup::is_enabled(),
+            hfp_trace_status: self.hfp_trace_status.clone(),
             devices: self.current.as_ref().map(|view| view.devices.clone()).unwrap_or_default(),
             version: updater::build_version().to_owned(),
             update: self.update_state(),
@@ -871,6 +917,8 @@ impl Tray {
     }
 
     fn save_settings(&mut self, shell: &Shell, mut candidate: Settings) {
+        let trace_changed = candidate.hfp_trace_enabled != self.settings.values.hfp_trace_enabled;
+        let startup_changed = candidate.start_with_windows != startup::is_enabled();
         candidate.learned_battery_rates = self.settings.values.learned_battery_rates.clone();
         candidate.cached_battery_readings = self.settings.values.cached_battery_readings.clone();
         let result = self.settings.save(candidate).err().map(|message| format!("Could not save settings:\n\n{message}"));
@@ -882,7 +930,9 @@ impl Tray {
             return;
         }
         self.restart_allowed.store(true, Ordering::SeqCst);
-        if let Err(message) = startup::set_enabled(self.settings.values.start_with_windows) {
+        if startup_changed
+            && let Err(message) = startup::set_enabled(self.settings.values.start_with_windows)
+        {
             let mut corrected = self.settings.values.clone();
             corrected.start_with_windows = startup::is_enabled();
             let mut text = format!("Could not update Windows startup setting:\n\n{message}");
@@ -890,6 +940,11 @@ impl Tray {
                 text.push_str(&format!("\n\nThe corrected setting could not be saved: {save_error}"));
             }
             shell.message(SETTINGS_TITLE, &text, true);
+        }
+        if trace_changed {
+            self.hfp_trace_status = None;
+            let _ = self.commands.send(WorkerCommand::SetHfpTrace(self.settings.values.hfp_trace_enabled));
+            shell.set_timer(TIMER_CONNECTION, CONNECTION_DEBOUNCE_MS);
         }
         self.first_threshold_level = None;
         self.second_threshold_level = None;

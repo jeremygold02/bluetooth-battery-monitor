@@ -56,6 +56,7 @@ pub struct UpdateStatus {
 pub struct SettingsInit {
     pub settings: Settings,
     pub start_with_windows: bool,
+    pub hfp_trace_status: Option<String>,
     pub devices: Vec<Device>,
     pub version: String,
     pub update: UpdateStatus,
@@ -66,6 +67,7 @@ pub struct SettingsInit {
 pub enum ToSettings {
     Init(Box<SettingsInit>),
     Devices(Vec<Device>),
+    HfpTraceStatus(Option<String>),
     Update(UpdateStatus),
     SaveResult(Option<String>),
     Activate,

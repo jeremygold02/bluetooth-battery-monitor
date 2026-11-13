@@ -301,7 +301,7 @@ impl RateTracker {
                 -1,
                 average_rate(&value.discharge_samples),
                 percent,
-                false,
+                true,
             )),
             _ => None,
         }
@@ -459,7 +459,10 @@ mod tests {
             Some("Avg. +30%/h \u{00b7} ~2h 0m to full".to_owned())
         );
         tracker.reset();
-        assert_eq!(step(&mut tracker, "mouse", 40, "Connected", 30.0), Some("Avg. use \u{2212}2.5%/h".to_owned()));
+        assert_eq!(
+            step(&mut tracker, "mouse", 40, "Connected", 30.0),
+            Some("Avg. use \u{2212}2.5%/h \u{00b7} ~16h 0m remaining".to_owned())
+        );
     }
 
     #[test]
@@ -541,6 +544,9 @@ mod tests {
             discharge_samples: vec![LearnedBatteryRateSample { percent: 5.0, seconds: 7200.0 }],
             ..Default::default()
         }]);
-        assert_eq!(step(&mut tracker, "mouse", 40, "Connected", 1.0), Some("Avg. use \u{2212}2,5%/h".to_owned()));
+        assert_eq!(
+            step(&mut tracker, "mouse", 40, "Connected", 1.0),
+            Some("Avg. use \u{2212}2,5%/h \u{00b7} ~16h 0m remaining".to_owned())
+        );
     }
 }

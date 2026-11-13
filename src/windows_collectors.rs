@@ -1,5 +1,7 @@
 use crate::probe::ProbeResult;
+use std::collections::HashSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::ptr::null_mut;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use windows::Devices::Bluetooth::GenericAttributeProfile::{
     GattCharacteristicUuids, GattCommunicationStatus, GattDeviceService, GattServiceUuids,
@@ -18,6 +20,12 @@ use windows::Win32::Devices::Properties::DEVPROPTYPE;
 use windows::Win32::Foundation::DEVPROPKEY;
 use windows::Win32::System::Com::CoIncrementMTAUsage;
 use windows::core::{Error, GUID, Owned, PCWSTR, RuntimeType};
+use windows_sys::Win32::Devices::Bluetooth::{
+    BLUETOOTH_DEVICE_INFO, BLUETOOTH_DEVICE_SEARCH_PARAMS, BluetoothFindDeviceClose,
+    BluetoothFindFirstDevice, BluetoothFindNextDevice,
+};
+
+mod soundcore;
 
 const DEVICE_PROPERTY_FORMAT: GUID = GUID::from_u128(0xA45C254E_DF1C_4EFD_8020_67D146A850E0);
 const BATTERY_LIFE_KEY: DEVPROPKEY = DEVPROPKEY {
@@ -47,6 +55,9 @@ const WINDOWS_SOURCE: &str = "Windows";
 const WINDOWS_PRIORITY: i32 = 10;
 const BLUETOOTH_LE_SOURCE: &str = "Bluetooth LE";
 const BLUETOOTH_LE_PRIORITY: i32 = 20;
+const HFP_SERVICE_INSTANCE_PREFIX: &str = "BTHENUM\\{0000111E-0000-1000-8000-00805F9B34FB}_";
+const HFP_SOURCE: &str = "Bluetooth HFP";
+const HFP_PRIORITY: i32 = 25;
 const MISSING_OBJECT_MESSAGE: &str = "Object reference not set to an instance of an object.";
 
 static MULTITHREADED_APARTMENT_HELD: Mutex<bool> = Mutex::new(false);
@@ -89,6 +100,80 @@ pub fn collect_battery_properties() -> Result<Vec<ProbeResult>, String> {
             friendly_name
         };
         results.push(windows_battery_result(&instance_id, name, percent));
+    }
+
+    Ok(results)
+}
+
+pub fn collect_connected_hfp_devices(errors: &mut Vec<String>) -> Result<Vec<ProbeResult>, String> {
+    let mut results = Vec::new();
+    let connected_addresses = connected_bluetooth_addresses();
+    if connected_addresses.is_empty() {
+        return Ok(results);
+    }
+    let Ok(device_info_handle) = (unsafe {
+        SetupDiGetClassDevsW(None, PCWSTR::null(), None, DIGCF_PRESENT | DIGCF_ALLCLASSES)
+    }) else {
+        return Ok(results);
+    };
+    let device_info_set = unsafe { Owned::new(device_info_handle) };
+    let mut seen_addresses = HashSet::new();
+
+    for member_index in 0..=u32::MAX {
+        let mut device = SP_DEVINFO_DATA {
+            cbSize: size_of::<SP_DEVINFO_DATA>() as u32,
+            ..Default::default()
+        };
+        if unsafe { SetupDiEnumDeviceInfo(*device_info_set, member_index, &mut device) }.is_err() {
+            break;
+        }
+        let Some(instance_id) = read_instance_id(*device_info_set, &device) else {
+            continue;
+        };
+        if !instance_id
+            .get(..HFP_SERVICE_INSTANCE_PREFIX.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(HFP_SERVICE_INSTANCE_PREFIX))
+        {
+            continue;
+        }
+        let Some(address) = hfp_bluetooth_address(&instance_id) else {
+            continue;
+        };
+        if !connected_addresses.contains(&address) {
+            continue;
+        }
+        if !seen_addresses.insert(address) {
+            continue;
+        }
+
+        let friendly_name = read_string_property(*device_info_set, &device, &FRIENDLY_NAME_KEY);
+        let raw_name = if is_blank(&friendly_name) {
+            read_string_property(*device_info_set, &device, &DEVICE_DESCRIPTION_KEY)
+        } else {
+            friendly_name
+        };
+        let mut result = ProbeResult {
+            id: format!("hfp:{address:012X}"),
+            physical_id: None,
+            name: hfp_display_name(&raw_name),
+            percent: None,
+            source: HFP_SOURCE.to_owned(),
+            status: CONNECTED_STATUS.to_owned(),
+            priority: HFP_PRIORITY,
+        };
+        if result.name.eq_ignore_ascii_case(soundcore::MODEL_NAME) {
+            match soundcore::read_battery(address) {
+                Ok(Some(reading)) => {
+                    result.percent = Some(reading.percent);
+                    result.source = soundcore::SOURCE.to_owned();
+                    result.status = reading.status.to_owned();
+                    result.priority += 1;
+                }
+                Ok(None) => {}
+                Err(error) => errors.push(format!("{}: {}", result.name, describe_failure(&error))),
+            }
+        }
+        results.push(result);
     }
 
     Ok(results)
@@ -334,6 +419,68 @@ fn is_wireless_device_instance(instance_id: &str) -> bool {
             .get(..prefix.len())
             .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
     })
+}
+
+fn hfp_bluetooth_address(instance_id: &str) -> Option<u64> {
+    let suffix = instance_id.rsplit_once("&0&")?.1;
+    let address = suffix.get(..12)?;
+    if !address.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(address, 16).ok()
+}
+
+fn connected_bluetooth_addresses() -> HashSet<u64> {
+    let search = BLUETOOTH_DEVICE_SEARCH_PARAMS {
+        dwSize: size_of::<BLUETOOTH_DEVICE_SEARCH_PARAMS>() as u32,
+        fReturnAuthenticated: 1,
+        fReturnRemembered: 1,
+        fReturnUnknown: 0,
+        fReturnConnected: 1,
+        fIssueInquiry: 0,
+        cTimeoutMultiplier: 0,
+        hRadio: null_mut(),
+    };
+    let mut info = BLUETOOTH_DEVICE_INFO {
+        dwSize: size_of::<BLUETOOTH_DEVICE_INFO>() as u32,
+        ..Default::default()
+    };
+    let handle = unsafe { BluetoothFindFirstDevice(&search, &mut info) };
+    if handle.is_null() {
+        return HashSet::new();
+    }
+
+    let mut addresses = HashSet::new();
+    loop {
+        if info.fConnected != 0 {
+            let address = unsafe { info.Address.Anonymous.ullLong } & 0x0000_FFFF_FFFF_FFFF;
+            if address != 0 {
+                addresses.insert(address);
+            }
+        }
+        info = BLUETOOTH_DEVICE_INFO {
+            dwSize: size_of::<BLUETOOTH_DEVICE_INFO>() as u32,
+            ..Default::default()
+        };
+        if unsafe { BluetoothFindNextDevice(handle, &mut info) } == 0 {
+            break;
+        }
+    }
+    unsafe { BluetoothFindDeviceClose(handle) };
+    addresses
+}
+
+fn hfp_display_name(raw_name: &str) -> String {
+    let name = raw_name.trim();
+    let lower_name = name.to_ascii_lowercase();
+    let suffix_length = if lower_name.ends_with(" hands-free ag") {
+        " hands-free ag".len()
+    } else if lower_name.ends_with(" hands-free") {
+        " hands-free".len()
+    } else {
+        0
+    };
+    name[..name.len() - suffix_length].trim().to_owned()
 }
 
 fn is_blank(text: &str) -> bool {

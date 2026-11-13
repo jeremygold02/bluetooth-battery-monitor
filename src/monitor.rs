@@ -40,7 +40,6 @@ pub struct Monitor {
     last_cache_revision: Vec<(String, i64)>,
     cache_revision: u64,
     rates: RateTracker,
-    format_date_time: fn(i64) -> String,
 }
 
 fn generated_id(attempted_at: i64) -> String {
@@ -80,13 +79,12 @@ fn round_half_even(value: f64) -> f64 {
 }
 
 impl Monitor {
-    pub fn new(decimal_separator: &str, format_date_time: fn(i64) -> String) -> Self {
+    pub fn new(decimal_separator: &str) -> Self {
         Self {
             cache: Vec::new(),
             last_cache_revision: Vec::new(),
             cache_revision: 0,
             rates: RateTracker::new(decimal_separator),
-            format_date_time,
         }
     }
 
@@ -221,10 +219,6 @@ impl Monitor {
         self.cache.iter().position(|device| same_id(&device.id, id))
     }
 
-    fn cached_status(&self, observed_at: i64) -> String {
-        format!("Last reported {} \u{00b7} sleeping or unavailable", (self.format_date_time)(observed_at))
-    }
-
     fn remember(&mut self, value: &Device) {
         if !has_stable_id(&value.id)
             || value.name.chars().count() > MAXIMUM_TEXT_LENGTH
@@ -294,7 +288,6 @@ impl Monitor {
                 current.observed_at = cached.observed_at;
                 current.cached = true;
                 current.physical_id = cached.physical_id.clone();
-                current.status = self.cached_status(cached.observed_at);
                 if current.name.eq_ignore_ascii_case(LOGITECH_FALLBACK_NAME) && !blank(&cached.name) {
                     current.name = cached.name.clone();
                 }
@@ -307,7 +300,7 @@ impl Monitor {
             }
             let mut missing = cached.clone();
             missing.cached = true;
-            missing.status = self.cached_status(cached.observed_at);
+            missing.status = "Not connected".to_owned();
             missing.estimate = None;
             hydrated.push(missing);
         }
@@ -365,12 +358,8 @@ mod tests {
 
     const NOW: i64 = 1_762_790_400_000;
 
-    fn stamp(value: i64) -> String {
-        format!("t{value}")
-    }
-
     fn monitor() -> Monitor {
-        Monitor::new(".", stamp)
+        Monitor::new(".")
     }
 
     fn probe(id: &str, name: &str, percent: Option<u8>, status: &str) -> ProbeResult {
@@ -401,7 +390,7 @@ mod tests {
         assert_eq!(absent.devices.len(), 1);
         assert_eq!(absent.devices[0].percent, Some(100));
         assert!(absent.devices[0].cached);
-        assert_eq!(absent.devices[0].status, format!("Last reported t{} \u{00b7} sleeping or unavailable", NOW + 60_000));
+        assert_eq!(absent.devices[0].status, "Not connected");
         assert_eq!(absent.status_message, None);
     }
 
@@ -420,6 +409,7 @@ mod tests {
         assert_eq!(asleep.devices[0].percent, Some(64));
         assert!(asleep.devices[0].cached);
         assert_eq!(asleep.devices[0].observed_at, NOW);
+        assert_eq!(asleep.devices[0].status, "Sleeping or unavailable");
     }
 
     #[test]

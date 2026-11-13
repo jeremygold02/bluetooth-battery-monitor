@@ -82,6 +82,7 @@ pub struct Settings {
     pub show_additional_limits: bool,
     pub show_reset_availability: bool,
     pub start_with_windows: bool,
+    pub hfp_trace_enabled: bool,
     pub threshold_notifications: bool,
     pub refresh_seconds: i32,
     pub idle_refresh_seconds: i32,
@@ -115,6 +116,7 @@ impl Default for Settings {
             show_additional_limits: true,
             show_reset_availability: true,
             start_with_windows: false,
+            hfp_trace_enabled: false,
             threshold_notifications: false,
             refresh_seconds: 60,
             idle_refresh_seconds: 0,
@@ -179,6 +181,7 @@ impl Settings {
             && self.show_popup_last_updated == other.show_popup_last_updated
             && self.show_reset_availability == other.show_reset_availability
             && self.start_with_windows == other.start_with_windows
+            && self.hfp_trace_enabled == other.hfp_trace_enabled
             && self.threshold_notifications == other.threshold_notifications
             && self.show_tray_box == other.show_tray_box
             && self.use_custom_tray_box_color == other.use_custom_tray_box_color
@@ -528,13 +531,16 @@ mod tests {
         );
         assert_eq!(store.values.cached_battery_readings[0].observed_at, 1_762_790_400_000);
         assert_eq!(store.values.cached_battery_readings[0].physical_id, None);
+        assert!(!store.values.hfp_trace_enabled);
 
         let mut candidate = store.values.clone();
         candidate.low_threshold = 40;
+        candidate.hfp_trace_enabled = true;
         store.save(candidate).unwrap();
         assert!(backup_path(&path).exists());
         let reloaded = SettingsStore::load(&path);
         assert_eq!(reloaded.values, store.values);
+        assert!(reloaded.values.hfp_trace_enabled);
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(written.contains(r#""ObservedAt":"\/Date(1762790400000)\/""#));
         assert!(written.contains(r#""IconDeviceId":"hyperx:\\\\?\\hid#vid_03f0""#));

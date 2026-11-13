@@ -77,6 +77,7 @@ pub fn run_demo(page: usize, light: bool) -> eframe::Result {
     let init = SettingsInit {
         settings,
         start_with_windows: false,
+        hfp_trace_status: None,
         devices: vec![
             device("HyperX Cloud III S Wireless", "HyperX 2.4 GHz", Some(53)),
             device("PRO X SUPERLIGHT 2c", "Logitech LIGHTSPEED", Some(79)),
@@ -177,6 +178,7 @@ struct Form {
     show_updated: bool,
     show_more: bool,
     start_with_windows: bool,
+    hfp_trace_enabled: bool,
     notifications: bool,
     show_tray_box: bool,
     use_custom_box: bool,
@@ -278,6 +280,7 @@ impl Form {
             show_updated: base.show_popup_last_updated,
             show_more: base.show_reset_availability,
             start_with_windows,
+            hfp_trace_enabled: base.hfp_trace_enabled,
             notifications: base.threshold_notifications,
             show_tray_box: base.show_tray_box,
             use_custom_box: base.use_custom_tray_box_color,
@@ -325,6 +328,7 @@ impl Form {
         candidate.show_popup_last_updated = self.show_updated;
         candidate.show_reset_availability = self.show_more;
         candidate.start_with_windows = self.start_with_windows;
+        candidate.hfp_trace_enabled = self.hfp_trace_enabled;
         candidate.threshold_notifications = self.notifications;
         candidate.show_tray_box = self.show_tray_box;
         candidate.use_custom_tray_box_color = self.use_custom_box;
@@ -350,6 +354,7 @@ impl Form {
         self.show_updated = defaults.show_popup_last_updated;
         self.show_more = defaults.show_reset_availability;
         self.start_with_windows = defaults.start_with_windows;
+        self.hfp_trace_enabled = defaults.hfp_trace_enabled;
         self.notifications = defaults.threshold_notifications;
         self.show_tray_box = defaults.show_tray_box;
         self.use_custom_box = defaults.use_custom_tray_box_color;
@@ -386,6 +391,7 @@ struct App {
     page: usize,
     version: String,
     update: UpdateStatus,
+    hfp_trace_status: Option<String>,
     save_blocked: Option<String>,
     message: Option<String>,
     saving: bool,
@@ -426,6 +432,7 @@ impl App {
             page,
             version: init.version,
             update: init.update,
+            hfp_trace_status: init.hfp_trace_status,
             save_blocked: init.save_blocked,
             message: None,
             saving: false,
@@ -518,6 +525,7 @@ impl App {
                 Incoming::Disconnected => ctx.send_viewport_cmd(ViewportCommand::Close),
                 Incoming::Message(ToSettings::Init(_)) => {}
                 Incoming::Message(ToSettings::Devices(devices)) => self.form.update_devices(&devices),
+                Incoming::Message(ToSettings::HfpTraceStatus(status)) => self.hfp_trace_status = status,
                 Incoming::Message(ToSettings::Update(update)) => self.update = update,
                 Incoming::Message(ToSettings::SaveResult(None)) => {
                     self.saved = self.form.candidate();
@@ -847,6 +855,20 @@ impl App {
                 number(ui, theme, &mut self.form.refresh, "refresh", 145.0);
                 label(ui, "seconds", 15.0, theme.secondary, false);
             });
+            ui.add_space(10.0);
+            check(ui, theme, &mut self.form.hfp_trace_enabled, "Listen for Hands-Free battery reports");
+            label(
+                ui,
+                "For compatible headsets. Windows may require administrator permissions.",
+                13.0,
+                theme.secondary,
+                false,
+            );
+            if self.form.hfp_trace_enabled && self.saved.hfp_trace_enabled {
+                ui.add_space(5.0);
+                let status = self.hfp_trace_status.as_deref().unwrap_or("Starting Hands-Free battery reporting...");
+                label(ui, status, 13.0, theme.secondary, false);
+            }
         });
         card(ui, theme, |ui| {
             label(ui, "Startup", 15.0, theme.foreground, true);
@@ -1164,6 +1186,10 @@ mod tests {
         assert!(saved.start_with_windows);
         assert!(saved.editable_equals(&form.candidate()));
 
+        form.hfp_trace_enabled = true;
+        assert!(form.candidate().hfp_trace_enabled);
+        assert!(!saved.editable_equals(&form.candidate()));
+        form.hfp_trace_enabled = false;
         form.text_color = [0, 0, 0];
         assert!(!saved.editable_equals(&form.candidate()));
         form.restore_defaults();
@@ -1172,5 +1198,6 @@ mod tests {
         assert_eq!((defaults.critical_threshold, defaults.low_threshold, defaults.refresh_seconds), (15, 25, 60));
         assert_eq!(defaults.icon_device_id, "b");
         assert!(!defaults.start_with_windows);
+        assert!(!defaults.hfp_trace_enabled);
     }
 }

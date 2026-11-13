@@ -19,7 +19,9 @@ serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
 windows = { version = "=0.62.2", features = [
     "Devices_Bluetooth_GenericAttributeProfile",
+    "Devices_Bluetooth_Rfcomm",
     "Devices_Enumeration",
+    "Networking_Sockets",
     "Storage_Streams",
     "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_Devices_Properties",
@@ -31,10 +33,13 @@ windows = { version = "=0.62.2", features = [
     "Win32_System_Threading",
 ] }
 windows-sys = { version = "=0.61.2", features = [
+    "Win32_Devices_Bluetooth",
+    "Win32_Devices_HumanInterfaceDevice",
     "Win32_Foundation",
     "Win32_Globalization",
     "Win32_Graphics_Gdi",
     "Win32_Security",
+    "Win32_System_Diagnostics_Etw",
     "Win32_Storage_FileSystem",
     "Win32_System_LibraryLoader",
     "Win32_System_Registry",

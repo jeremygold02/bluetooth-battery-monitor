@@ -147,16 +147,22 @@ fn compact(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn row_unavailable(device: &Device) -> bool {
+    let status = device.status.as_str();
+    status.eq_ignore_ascii_case("Not connected")
+        || ((device.cached || device.percent.is_none())
+            && status.to_ascii_lowercase().ends_with("unavailable"))
+}
+
 fn detail_text(device: &Device, view: &PopupView) -> Option<String> {
     let status = compact(&device.status);
+    if row_unavailable(device) {
+        return Some(status);
+    }
     if !view.show_details {
         return device.cached.then(|| if is_routine_status(&status) { "Cached reading".to_owned() } else { status });
     }
     let mut details = Vec::new();
-    let source = compact(&device.source);
-    if !source.is_empty() {
-        details.push(source);
-    }
     if let Some(estimate) = device.estimate.as_deref().map(compact).filter(|estimate| !estimate.is_empty()) {
         details.push(estimate);
     }
@@ -177,13 +183,10 @@ fn description(device: &Device) -> Vec<(&'static str, String)> {
         "Battery",
         device.percent.map_or_else(|| "unavailable".to_owned(), |percent| format!("{percent}%")),
     )];
-    if !device.source.trim().is_empty() {
-        lines.push(("Source", device.source.trim().to_owned()));
-    }
     if !device.status.trim().is_empty() {
         lines.push(("Status", device.status.trim().to_owned()));
     }
-    if device.cached && is_routine_status(&compact(&device.status)) {
+    if device.cached {
         lines.push(("Reading", "Cached".to_owned()));
     }
     if let Some(estimate) = device.estimate.as_deref().filter(|estimate| !estimate.trim().is_empty()) {
@@ -590,13 +593,18 @@ fn header_button(
 }
 
 fn draw_row(painter: &egui::Painter, card: Rect, device: &Device, row: &RowLayout, theme: &Theme, view: &PopupView) {
+    let unavailable = row_unavailable(device);
+    let mut painter = painter.clone();
+    if unavailable && !theme.high_contrast {
+        painter.multiply_opacity(0.6);
+    }
     painter.rect_filled(card, CornerRadius::same(6), theme.popup_surface);
     let center_y = card.center().y;
     let divider = (card.top() + 10.0)..=(card.bottom() - 10.0);
     let divider_stroke = Stroke::new(1.0, theme.popup_divider);
 
     theme::paint_icon(
-        painter,
+        &painter,
         Pos2::new(card.left() + 20.0, center_y),
         theme::device_glyph(&device.name),
         25.0,
@@ -604,12 +612,12 @@ fn draw_row(painter: &egui::Painter, card: Rect, device: &Device, row: &RowLayou
     );
     painter.vline(card.left() + 40.5, divider.clone(), divider_stroke);
 
-    let color = theme.battery_color(device.percent, view);
+    let color = if unavailable { theme.popup_plain_bar } else { theme.battery_color(device.percent, view) };
     let percent_label = device.percent.map_or_else(|| "--".to_owned(), |percent| format!("{percent}%"));
     let percent_text = painter.layout_no_wrap(percent_label, theme::semibold(22.0), theme.popup_foreground);
     let group_width = 40.0 + 8.0 + percent_text.size().x;
     let group_left = card.left() + 41.0 + (120.0 - group_width) / 2.0;
-    draw_gauge(painter, Pos2::new(group_left + 20.0, center_y), device, theme, color);
+    draw_gauge(&painter, Pos2::new(group_left + 20.0, center_y), device, theme, color);
     let percent_height = percent_text.size().y;
     painter.galley(
         Pos2::new(group_left + 48.0, center_y - percent_height / 2.0),
@@ -651,7 +659,7 @@ fn draw_gauge(painter: &egui::Painter, center: Pos2, device: &Device, theme: &Th
     let charging = device.status.get(..8).is_some_and(|prefix| prefix.eq_ignore_ascii_case("Charging"));
     let glyph = match device.percent {
         None => theme::GLYPH_BATTERY_UNKNOWN,
-        Some(_) if charging => theme::GLYPH_BATTERY_CHARGING,
+        Some(_) if charging => theme::GLYPH_LIGHTNING_BOLT,
         Some(_) => theme::GLYPH_BATTERY,
     };
     theme::paint_icon(painter, center, glyph, 18.0, color);
@@ -684,7 +692,7 @@ fn demo_state(states: bool, light: bool) -> PopupState {
     if states {
         devices[0].estimate = Some("Avg. \u{2212}1.25%/h \u{00b7} ~48m remaining".to_owned());
         devices[1].cached = true;
-        devices[1].status = "Last reported 11/8/2026 3:09 AM \u{00b7} sleeping or unavailable".to_owned();
+        devices[1].status = "Not connected".to_owned();
         devices[2].estimate = Some("Est. +18.5%/h \u{00b7} ~4h 16m to full".to_owned());
     }
     let mut view = PopupView::from_settings(&Settings::default());
@@ -720,17 +728,17 @@ mod tests {
     }
 
     #[test]
-    fn details_show_source_rate_and_only_unusual_statuses() {
+    fn details_show_rate_and_only_unusual_statuses() {
         let details = |status: &str, cached: bool, estimate: Option<&str>| {
             detail_text(&device(status, cached, estimate), &view(true))
         };
-        assert_eq!(details("Discharging", false, None).as_deref(), Some("Logitech LIGHTSPEED"));
+        assert_eq!(details("Discharging", false, None), None);
         assert_eq!(
             details("Discharging", false, Some("Avg. \u{2212}2%/h")).as_deref(),
-            Some("Logitech LIGHTSPEED \u{00b7} Avg. \u{2212}2%/h")
+            Some("Avg. \u{2212}2%/h")
         );
-        assert_eq!(details("Charging", false, None).as_deref(), Some("Logitech LIGHTSPEED \u{00b7} Charging"));
-        assert_eq!(details("Connected", true, None).as_deref(), Some("Logitech LIGHTSPEED \u{00b7} Cached reading"));
+        assert_eq!(details("Charging", false, None).as_deref(), Some("Charging"));
+        assert_eq!(details("Connected", true, None).as_deref(), Some("Cached reading"));
     }
 
     #[test]
@@ -738,14 +746,15 @@ mod tests {
         let details = |status: &str, cached: bool| detail_text(&device(status, cached, Some("Avg.")), &view(false));
         assert_eq!(details("Charging", false), None);
         assert_eq!(details("Not charging", true).as_deref(), Some("Cached reading"));
-        assert_eq!(details("Last reported today", true).as_deref(), Some("Last reported today"));
+        assert_eq!(details("Not connected", true).as_deref(), Some("Not connected"));
+        assert_eq!(details("Sleeping or unavailable", true).as_deref(), Some("Sleeping or unavailable"));
     }
 
     #[test]
-    fn tooltips_list_every_known_fact() {
+    fn tooltips_show_battery_status_and_rate() {
         let lines = description(&device("Connected", true, Some("Avg. \u{2212}2%/h")));
         let labels: Vec<&str> = lines.iter().map(|(label, _)| *label).collect();
-        assert_eq!(labels, ["Battery", "Source", "Status", "Reading", "Rate"]);
+        assert_eq!(labels, ["Battery", "Status", "Reading", "Rate"]);
         let unknown = Device { percent: None, ..Default::default() };
         assert_eq!(description(&unknown), vec![("Battery", "unavailable".to_owned())]);
     }
