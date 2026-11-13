@@ -42,22 +42,6 @@ jobs:
             throw "Build created an empty executable."
           }
 
-      - name: Build update bridge
-        shell: pwsh
-        run: |
-          $native = (Resolve-Path "target\release\BluetoothBatteryMonitor.exe").Path
-          dotnet build "bridge\BluetoothBatteryMonitor.csproj" -c Release --nologo --artifacts-path "artifacts\bridge" `
-            "-p:BridgeVersion=99.0.0" "-p:NativeExecutable=$native"
-          if ($LASTEXITCODE -ne 0) { throw "Bridge build failed." }
-
-      - name: Test updating from released versions
-        shell: pwsh
-        run: |
-          .\bridge\tests\run-migration-test.ps1 `
-            -Bridge "artifacts\bridge\bin\BluetoothBatteryMonitor\release\BluetoothBatteryMonitor.exe" `
-            -NativeExecutable "target\release\BluetoothBatteryMonitor.exe" `
-            -Version 99.0.0
-
       - name: Collect license notices
         shell: pwsh
         run: .\tools\collect-licenses.ps1 -Destination "artifacts\build"

@@ -5,6 +5,7 @@
 /artifacts/
 /bin/
 /obj/
+/installer/output/
 
 # Local batch helpers
 *.bat
@@ -12,7 +13,3 @@
 # Rust build output
 /target/
 /screenshots/
-
-# Bridge build output
-/bridge/**/bin/
-/bridge/**/obj/
