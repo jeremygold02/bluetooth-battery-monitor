@@ -16,7 +16,7 @@ use windows::Win32::Devices::DeviceAndDriverInstallation::{
     DIGCF_ALLCLASSES, DIGCF_PRESENT, HDEVINFO, SP_DEVINFO_DATA, SetupDiEnumDeviceInfo,
     SetupDiGetClassDevsW, SetupDiGetDeviceInstanceIdW, SetupDiGetDevicePropertyW,
 };
-use windows::Win32::Devices::Properties::DEVPROPTYPE;
+use windows::Win32::Devices::Properties::{DEVPROP_TYPE_BYTE, DEVPROPTYPE};
 use windows::Win32::Foundation::DEVPROPKEY;
 use windows::Win32::System::Com::CoIncrementMTAUsage;
 use windows::core::{Error, GUID, Owned, PCWSTR, RuntimeType};
@@ -31,6 +31,11 @@ const DEVICE_PROPERTY_FORMAT: GUID = GUID::from_u128(0xA45C254E_DF1C_4EFD_8020_6
 const BATTERY_LIFE_KEY: DEVPROPKEY = DEVPROPKEY {
     fmtid: GUID::from_u128(0x49CD1F76_5626_4B17_A4E8_18B4AA1A2213),
     pid: 10,
+};
+// Windows stores the reported battery percentage on the Hands-Free service node.
+const BLUETOOTH_BATTERY_LEVEL_KEY: DEVPROPKEY = DEVPROPKEY {
+    fmtid: GUID::from_u128(0x104EA319_6EE2_4701_BD47_8DDBF425BBE5),
+    pid: 2,
 };
 const FRIENDLY_NAME_KEY: DEVPROPKEY = DEVPROPKEY {
     fmtid: DEVICE_PROPERTY_FORMAT,
@@ -152,28 +157,30 @@ pub fn collect_connected_hfp_devices(errors: &mut Vec<String>) -> Result<Vec<Pro
         } else {
             friendly_name
         };
-        let mut result = ProbeResult {
-            id: format!("hfp:{address:012X}"),
-            physical_id: None,
-            name: hfp_display_name(&raw_name),
-            percent: None,
-            source: HFP_SOURCE.to_owned(),
-            status: CONNECTED_STATUS.to_owned(),
-            priority: HFP_PRIORITY,
+        let name = hfp_display_name(&raw_name);
+        let mut buffer = [0u8; 1];
+        let windows_percent = match read_device_property(
+            *device_info_set,
+            &device,
+            &BLUETOOTH_BATTERY_LEVEL_KEY,
+            &mut buffer,
+        ) {
+            Some((DEVPROP_TYPE_BYTE, 1)) => valid_battery_percent(buffer[0]),
+            _ => None,
         };
-        if result.name.eq_ignore_ascii_case(soundcore::MODEL_NAME) {
+        let soundcore_reading = if name.eq_ignore_ascii_case(soundcore::MODEL_NAME) {
             match soundcore::read_battery(address) {
-                Ok(Some(reading)) => {
-                    result.percent = Some(reading.percent);
-                    result.source = soundcore::SOURCE.to_owned();
-                    result.status = reading.status.to_owned();
-                    result.priority += 1;
+                Ok(reading) => reading,
+                Err(error) if windows_percent.is_none() => {
+                    errors.push(format!("{name}: {}", describe_failure(&error)));
+                    None
                 }
-                Ok(None) => {}
-                Err(error) => errors.push(format!("{}: {}", result.name, describe_failure(&error))),
+                Err(_) => None,
             }
-        }
-        results.push(result);
+        } else {
+            None
+        };
+        results.push(hfp_battery_result(address, name, windows_percent, soundcore_reading));
     }
 
     Ok(results)
@@ -334,7 +341,7 @@ fn read_device_property(
     device: &SP_DEVINFO_DATA,
     key: &DEVPROPKEY,
     buffer: &mut [u8],
-) -> Option<u32> {
+) -> Option<(DEVPROPTYPE, u32)> {
     let mut property_type = DEVPROPTYPE::default();
     let mut required_size = 0;
     unsafe {
@@ -349,12 +356,12 @@ fn read_device_property(
         )
     }
     .ok()?;
-    Some(required_size)
+    Some((property_type, required_size))
 }
 
 fn read_battery_percent(device_info_set: HDEVINFO, device: &SP_DEVINFO_DATA) -> Option<u8> {
     let mut buffer = [0u8; BATTERY_PROPERTY_BUFFER_BYTES];
-    let required_size =
+    let (_, required_size) =
         read_device_property(device_info_set, device, &BATTERY_LIFE_KEY, &mut buffer)?;
     battery_percent_from_property(&buffer, required_size)
 }
@@ -366,7 +373,7 @@ fn read_string_property(
 ) -> String {
     let mut buffer = [0u8; STRING_PROPERTY_BUFFER_BYTES];
     read_device_property(device_info_set, device, key, &mut buffer)
-        .map(|required_size| decode_string_property(&buffer, required_size))
+        .map(|(_, required_size)| decode_string_property(&buffer, required_size))
         .unwrap_or_default()
 }
 
@@ -496,6 +503,29 @@ fn windows_battery_result(instance_id: &str, name: String, percent: u8) -> Probe
         source: WINDOWS_SOURCE.to_owned(),
         status: CONNECTED_STATUS.to_owned(),
         priority: WINDOWS_PRIORITY,
+    }
+}
+
+fn hfp_battery_result(
+    address: u64,
+    name: String,
+    windows_percent: Option<u8>,
+    soundcore_reading: Option<BatteryLevelReading>,
+) -> ProbeResult {
+    let status = soundcore_reading.as_ref().map_or(CONNECTED_STATUS, |reading| reading.status);
+    let (percent, source, priority) = match (windows_percent, soundcore_reading) {
+        (Some(percent), _) => (Some(percent), HFP_SOURCE, HFP_PRIORITY),
+        (None, Some(reading)) => (Some(reading.percent), soundcore::SOURCE, HFP_PRIORITY + 1),
+        (None, None) => (None, HFP_SOURCE, HFP_PRIORITY),
+    };
+    ProbeResult {
+        id: format!("hfp:{address:012X}"),
+        physical_id: None,
+        name,
+        percent,
+        source: source.to_owned(),
+        status: status.to_owned(),
+        priority,
     }
 }
 
@@ -867,6 +897,19 @@ mod tests {
     }
 
     #[test]
+    fn hfp_uses_the_windows_percentage_and_keeps_the_soundcore_charge_state() {
+        let address = 0x001122334455;
+        let soundcore = || Some(BatteryLevelReading { percent: 100, status: "Charging" });
+        let windows = hfp_battery_result(address, soundcore::MODEL_NAME.to_owned(), Some(90), soundcore());
+        let fallback = hfp_battery_result(address, soundcore::MODEL_NAME.to_owned(), None, soundcore());
+        assert_eq!(windows.id, "hfp:001122334455");
+        assert_eq!(windows.id, fallback.id);
+        assert_eq!((windows.percent, windows.source.as_str()), (Some(90), HFP_SOURCE));
+        assert_eq!((fallback.percent, fallback.source.as_str()), (Some(100), soundcore::SOURCE));
+        assert_eq!(windows.status, "Charging");
+    }
+
+    #[test]
     fn gatt_result_uses_persisted_key_format() {
         let reading = BatteryLevelReading {
             percent: 42,
@@ -1048,9 +1091,16 @@ mod tests {
     fn collectors_return_valid_readings_from_connected_hardware() {
         let windows_results = collect_battery_properties().expect("Windows battery properties");
         let mut device_errors = Vec::new();
+        let hfp_results = collect_connected_hfp_devices(&mut device_errors)
+            .expect("Bluetooth Hands-Free batteries");
         let gatt_results = collect_gatt_batteries(|message| device_errors.push(message))
             .expect("Bluetooth LE batteries");
         println!("{windows_results:#?}\n{gatt_results:#?}\n{device_errors:#?}");
+        for result in &hfp_results {
+            println!("{}: {:?} ({})", result.name, result.percent, result.source);
+            assert!(result.id.starts_with("hfp:"));
+            assert!(result.percent.is_none_or(|percent| percent <= 100));
+        }
         for result in &windows_results {
             let instance_id = result
                 .id

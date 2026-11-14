@@ -32,8 +32,8 @@ The monitor combines local Windows and device-protocol sources:
 
 - The Windows `System.Devices.BatteryLife` property and Bluetooth LE Battery Service, including charging state when a device reports it.
 - The HID Generic Device Controls Battery Strength usage (`0x06:0x20`) on Bluetooth and USB HID devices, including interfaces that are recognized before a battery report is available.
-- Soundcore Life Dot 2 NC battery and charging state over Bluetooth RFCOMM. The popup uses the lower reported level when both earbuds are available.
-- Connected classic Bluetooth Hands-Free Profile (HFP) devices are listed from Windows device information. For compatible headsets, enable **Settings → General → Listen for Hands-Free battery reports** to read battery messages transmitted by the headset. This is off by default, and its status appears in Settings. If Windows denies trace access, run the app as administrator or use an account in Performance Log Users.
+- Connected Bluetooth Hands-Free Profile (HFP) devices use the battery percentage Windows reports on their Hands-Free device entry. For headsets without that percentage, the optional **Settings → General → Listen for Hands-Free battery reports** setting can read compatible battery messages. Trace status appears in Settings. If Windows denies trace access, run the app as administrator or use an account in Performance Log Users.
+- Soundcore Life Dot 2 NC charging state over Bluetooth RFCOMM. When the Windows percentage is unavailable, the monitor uses the lower of the levels the earbuds report over RFCOMM in 20% steps.
 - Logitech HID++ battery features `0x1000` and `0x1004`, used by compatible LIGHTSPEED receivers.
 - The PRO X3 SUPERSTRIKE LIGHTSPEED receiver (`046D:C54F`), using its 20-byte HID++ interface; physical-device validation is pending.
 - HyperX Cloud III S Wireless dongle battery and charging-state responses for HP USB product IDs `02CC` and `06BE`.
