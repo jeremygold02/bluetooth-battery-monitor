@@ -439,15 +439,13 @@ impl Tray {
                 if self.popup.is_some() {
                     self.close_popup();
                 } else if self.popup_closed_at.is_none_or(|at| at.elapsed() > REOPEN_GUARD) {
-                    self.open_popup();
+                    self.open_popup(shell);
                 }
             }
             ShellEvent::Command(MENU_REFRESH, _) => self.refresh(shell, true),
             ShellEvent::Command(MENU_SHOW, point) => {
                 self.anchor = Some(point);
-                if self.popup.is_none() {
-                    self.open_popup();
-                }
+                self.open_popup(shell);
             }
             ShellEvent::Command(MENU_SETTINGS, _) => self.show_settings(),
             ShellEvent::Command(MENU_UPDATES, _) => self.check_for_updates(shell),
@@ -468,7 +466,7 @@ impl Tray {
             ShellEvent::Timer(TIMER_STARTUP_UI) => {
                 shell.kill_timer(TIMER_STARTUP_UI);
                 if std::mem::take(&mut self.show_popup_on_start) {
-                    self.open_popup();
+                    self.open_popup(shell);
                 }
                 if std::mem::take(&mut self.show_settings_on_start) {
                     self.show_settings();
@@ -851,19 +849,22 @@ impl Tray {
         }
     }
 
-    fn open_popup(&mut self) {
+    fn open_popup(&mut self, shell: &Shell) {
+        if self.popup.is_some() {
+            return;
+        }
         let mut arguments = vec!["--popup".to_owned()];
         if let Some(anchor) = self.anchor {
             arguments.push("--anchor".to_owned());
             arguments.push(format!("{},{}", anchor.x, anchor.y));
         }
-        let Some(mut popup) =
+        let Some(popup) =
             spawn_window(&arguments, &self.incoming, &self.waker, Incoming::Popup, Incoming::PopupClosed)
         else {
             return;
         };
-        let _ = ipc::write_message(&mut popup.input, &self.popup_state());
         self.popup = Some(popup);
+        self.refresh(shell, false);
     }
 
     fn close_popup(&mut self) {

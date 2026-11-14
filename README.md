@@ -54,7 +54,7 @@ Cached and unavailable readings do not contribute to the estimate. An interrupte
 
 ## Using the tray app
 
-- Left-click the tray icon to open or close the popup. Use its refresh button or **Refresh now** in the tray menu to check immediately.
+- Left-click the tray icon to open or close the popup. Opening it refreshes the battery readings. Use its refresh button or **Refresh now** in the tray menu to check again.
 - Open Settings from the popup gear or tray menu. A specific-device selection changes the tray icon; the popup can still show the other devices.
 - Hover over a device for battery, status, and rate details. Scroll the list when more devices are present than fit in the popup.
 - Rows for sleeping, disconnected, or unavailable devices are dimmed and can show the last known battery level. The app saves these readings locally so they remain available after a restart.
