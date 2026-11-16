@@ -27,6 +27,13 @@ pub struct Device {
     pub estimate: Option<String>,
 }
 
+impl Device {
+    pub fn is_connected(&self) -> bool {
+        self.status.eq_ignore_ascii_case("Connected")
+            || (!self.cached && self.percent.is_some() && !self.status.eq_ignore_ascii_case("Not connected"))
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct FetchResult {
     pub devices: Vec<Device>,
@@ -104,10 +111,9 @@ impl Monitor {
     pub fn initialize_cache(&mut self, readings: &[CachedBatteryReading], now: i64) {
         self.cache.clear();
         self.last_cache_revision.clear();
-        self.cache_revision = 0;
+        self.cache_revision = u64::from(!readings.is_empty());
         for reading in readings {
             if is_obsolete_superlight_wired_slot(&reading.id) {
-                self.cache_revision += 1;
                 continue;
             }
             let valid = has_stable_id(&reading.id)
@@ -131,9 +137,9 @@ impl Monitor {
                 source: reading.source.clone(),
                 priority: reading.priority,
                 observed_at: reading.observed_at,
+                cached: true,
                 ..Default::default()
             });
-            self.last_cache_revision.push((reading.id.clone(), reading.observed_at));
             if self.cache.len() >= MAXIMUM_CACHED_DEVICES {
                 break;
             }
@@ -147,6 +153,8 @@ impl Monitor {
         let mut readings: Vec<CachedBatteryReading> = self
             .cache
             .iter()
+            // Restored readings can be shown this session, but only live readings carry forward.
+            .filter(|device| !device.cached)
             .filter_map(|device| {
                 Some(CachedBatteryReading {
                     id: device.id.clone(),
@@ -194,7 +202,11 @@ impl Monitor {
                 .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
         });
 
-        let known: Vec<u8> = devices.iter().filter_map(|device| device.percent).collect();
+        let known: Vec<u8> = devices
+            .iter()
+            .filter(|device| device.is_connected())
+            .filter_map(|device| device.percent)
+            .collect();
         let total: u32 = known.iter().map(|percent| u32::from(*percent)).sum();
         let status_message = if devices.is_empty() {
             Some(if errors.is_empty() {
@@ -375,23 +387,69 @@ mod tests {
     }
 
     #[test]
-    fn a_higher_live_reading_replaces_the_cache_and_survives_absence() {
-        let mut monitor = monitor();
-        monitor.fetch(vec![probe("logitech:a:1", "Mouse", Some(35), "Discharging")], &[], NOW, 1.0);
-        let live = monitor.fetch(vec![probe("logitech:a:1", "Mouse", Some(100), "Charging")], &[], NOW + 60_000, 61.0);
+    fn a_last_reading_survives_only_one_restart_without_a_fresh_reading() {
+        let mut running = monitor();
+        running.fetch(vec![probe("logitech:a:1", "Mouse", Some(35), "Discharging")], &[], NOW, 1.0);
+        let live = running.fetch(vec![probe("logitech:a:1", "Mouse", Some(100), "Charging")], &[], NOW + 60_000, 61.0);
         assert_eq!(live.devices[0].percent, Some(100));
         assert!(!live.devices[0].cached);
-        let (revision, cache) = monitor.updated_cache(0).unwrap();
+        let (revision, cache) = running.updated_cache(0).unwrap();
         assert_eq!(cache[0].percent, 100);
         assert_eq!(cache[0].observed_at, NOW + 60_000);
-        assert!(monitor.updated_cache(revision).is_none());
+        assert!(running.updated_cache(revision).is_none());
 
-        let absent = monitor.fetch(Vec::new(), &[], NOW + 120_000, 121.0);
+        let disconnect = running.fetch(Vec::new(), &[], NOW + 120_000, 121.0);
+        assert_eq!(disconnect.devices[0].status, "Not connected");
+        assert_eq!((disconnect.lowest, disconnect.average), (None, None));
+        assert!(running.updated_cache(revision).is_none());
+
+        let mut restarted = monitor();
+        restarted.initialize_cache(&cache, NOW + 180_000);
+        let absent = restarted.fetch(Vec::new(), &[], NOW + 180_000, 1.0);
         assert_eq!(absent.devices.len(), 1);
         assert_eq!(absent.devices[0].percent, Some(100));
         assert!(absent.devices[0].cached);
         assert_eq!(absent.devices[0].status, "Not connected");
-        assert_eq!(absent.status_message, None);
+        assert_eq!((absent.lowest, absent.average), (None, None));
+        let (revision, cache) = restarted.updated_cache(0).unwrap();
+        assert!(cache.is_empty());
+
+        let mut restarted_again = monitor();
+        restarted_again.initialize_cache(&cache, NOW + 240_000);
+        assert!(restarted_again.fetch(Vec::new(), &[], NOW + 240_000, 1.0).devices.is_empty());
+
+        restarted.fetch(vec![probe("logitech:a:1", "Mouse", Some(100), "Charging")], &[], NOW + 240_000, 61.0);
+        let (_, refreshed_cache) = restarted.updated_cache(revision).unwrap();
+        assert_eq!(refreshed_cache[0].percent, 100);
+        assert_eq!(refreshed_cache[0].observed_at, NOW + 240_000);
+    }
+
+    #[test]
+    fn icon_metrics_use_connected_devices_with_a_known_level() {
+        let mut monitor = monitor();
+        monitor.fetch(
+            vec![
+                probe("hfp:a", "Earbuds", Some(5), "Connected"),
+                probe("logitech:b:1", "Mouse", Some(10), "Discharging"),
+                probe("hfp:c", "Headphones", Some(30), "Connected"),
+            ],
+            &[],
+            NOW,
+            1.0,
+        );
+        let result = monitor.fetch(
+            vec![
+                probe("logitech:b:1", "Mouse", None, "Sleeping or unavailable"),
+                probe("hfp:c", "Headphones", None, "Connected"),
+                probe("hyperx:d", "Headset", Some(70), "Not charging"),
+                probe("hfp:e", "Speaker", None, "Connected"),
+            ],
+            &[],
+            NOW + 60_000,
+            61.0,
+        );
+        assert_eq!(result.devices.len(), 5);
+        assert_eq!((result.lowest, result.average), (Some(30), Some(50)));
     }
 
     #[test]
@@ -510,12 +568,11 @@ mod tests {
             ],
             NOW,
         );
-        let (_, cache) = monitor.updated_cache(0).unwrap();
-        assert_eq!(cache.len(), 1);
-        assert_eq!(cache[0].percent, 80);
-        assert_eq!(cache[0].physical_id, None);
+        assert!(monitor.updated_cache(0).unwrap().1.is_empty());
         let shown = monitor.fetch(Vec::new(), &[], NOW, 1.0);
         assert_eq!(shown.devices.len(), 1);
+        assert_eq!(shown.devices[0].percent, Some(80));
+        assert_eq!(shown.devices[0].physical_id, None);
         assert!(shown.devices[0].cached);
     }
 

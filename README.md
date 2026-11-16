@@ -19,7 +19,7 @@ The per-user installer and in-app updater deliver the Soundcore battery reader i
 ## Features
 
 - Show supported device battery levels in a compact tray popup, with details available on hover.
-- Choose the lowest battery, average battery, or a specific device for the tray icon.
+- Choose the lowest or average battery level among connected devices, or show a specific device's level while it is connected.
 - Estimate charging and discharge rates from observed battery-level changes, with separate rolling histories for charging and usage.
 - Customize the tray icon background and text colors, theme, notification thresholds, popup details, refresh interval, and Windows startup behavior.
 - Refresh manually or automatically, including after a Bluetooth LE connection or disconnection.
@@ -57,7 +57,7 @@ Cached and unavailable readings do not contribute to the estimate. An interrupte
 - Left-click the tray icon to open or close the popup. Opening it refreshes the battery readings. Use its refresh button or **Refresh now** in the tray menu to check again.
 - Open Settings from the popup gear or tray menu. A specific-device selection changes the tray icon; the popup can still show the other devices.
 - Hover over a device for battery, status, and rate details. Scroll the list when more devices are present than fit in the popup.
-- Rows for sleeping, disconnected, or unavailable devices are dimmed and can show the last known battery level. The app saves these readings locally so they remain available after a restart.
+- Rows for sleeping, disconnected, or unavailable devices are dimmed and can show the last known battery level. A saved reading can carry over to the next app session. The monitor needs a fresh reading to carry it through another restart.
 
 ![Bluetooth Battery Monitor settings showing tray icon choices, preview, colors, and theme](docs/images/battery-settings.png)
 

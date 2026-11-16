@@ -114,21 +114,20 @@ impl HfpMonitor {
         if readings.is_empty() {
             return (Vec::new(), lock(&self.shared.runtime_error).take());
         }
-        let names = bluetooth_device_names();
+        let names = connected_bluetooth_device_names();
         let probes = readings
             .into_iter()
-            .map(|(address, percent)| ProbeResult {
-                id: format!("hfp:{address:012X}"),
-                physical_id: None,
-                name: names
-                    .get(&address)
-                    .filter(|name| !name.trim().is_empty())
-                    .cloned()
-                    .unwrap_or_else(|| format!("Wireless device {address:012X}")),
-                percent: Some(percent),
-                source: HFP_SOURCE.to_owned(),
-                status: "Connected".to_owned(),
-                priority: HFP_PRIORITY,
+            .filter_map(|(address, percent)| {
+                let name = names.get(&address)?.trim();
+                Some(ProbeResult {
+                    id: format!("hfp:{address:012X}"),
+                    physical_id: None,
+                    name: if name.is_empty() { format!("Wireless device {address:012X}") } else { name.to_owned() },
+                    percent: Some(percent),
+                    source: HFP_SOURCE.to_owned(),
+                    status: "Connected".to_owned(),
+                    priority: HFP_PRIORITY,
+                })
             })
             .collect();
         let runtime_error = lock(&self.shared.runtime_error).take();
@@ -501,7 +500,7 @@ fn read_bluetooth_address(bytes: &[u8]) -> Option<u64> {
     (address != 0).then_some(address)
 }
 
-fn bluetooth_device_names() -> HashMap<u64, String> {
+fn connected_bluetooth_device_names() -> HashMap<u64, String> {
     let search = BLUETOOTH_DEVICE_SEARCH_PARAMS {
         dwSize: size_of::<BLUETOOTH_DEVICE_SEARCH_PARAMS>() as u32,
         fReturnAuthenticated: 1,
@@ -524,14 +523,13 @@ fn bluetooth_device_names() -> HashMap<u64, String> {
     let mut names = HashMap::new();
     loop {
         let address = unsafe { info.Address.Anonymous.ullLong } & BLUETOOTH_ADDRESS_MASK;
-        let end = info
-            .szName
-            .iter()
-            .position(|unit| *unit == 0)
-            .unwrap_or(info.szName.len());
-        let name = String::from_utf16_lossy(&info.szName[..end]);
-        if address != 0 && !name.trim().is_empty() {
-            names.insert(address, name);
+        if address != 0 && info.fConnected != 0 {
+            let end = info
+                .szName
+                .iter()
+                .position(|unit| *unit == 0)
+                .unwrap_or(info.szName.len());
+            names.insert(address, String::from_utf16_lossy(&info.szName[..end]));
         }
         info = BLUETOOTH_DEVICE_INFO {
             dwSize: size_of::<BLUETOOTH_DEVICE_INFO>() as u32,

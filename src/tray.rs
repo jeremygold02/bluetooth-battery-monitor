@@ -390,6 +390,7 @@ fn summary_line(device: Option<&Device>) -> String {
 fn native_tooltip(view: &View) -> String {
     view.devices
         .iter()
+        .filter(|device| device.is_connected())
         .map(|device| {
             let name = display_name(device).replace(['\r', '\n'], " ");
             match device.percent {
@@ -418,7 +419,8 @@ fn icon_content(view: &View, settings: &Settings) -> IconContent {
         view.devices
             .iter()
             .find(|device| {
-                device.percent.is_some()
+                device.is_connected()
+                    && device.percent.is_some()
                     && !settings.icon_device_id.is_empty()
                     && device.id.to_lowercase() == settings.icon_device_id.to_lowercase()
             })
@@ -782,7 +784,8 @@ impl Tray {
         self.push_state();
         let threshold_shown = update_thresholds && self.notify_thresholds(shell, &view);
         if show_feedback && !threshold_shown {
-            let summary = format!("{} | {}", summary_line(view.devices.first()), summary_line(view.devices.get(1)));
+            let mut connected = view.devices.iter().filter(|device| device.is_connected());
+            let summary = format!("{} | {}", summary_line(connected.next()), summary_line(connected.next()));
             shell.notify(APP_TITLE, &summary, false);
         }
     }
@@ -976,20 +979,19 @@ mod tests {
         Device { id: format!("id:{name}"), name: name.to_owned(), percent, cached, ..Default::default() }
     }
 
-    fn view(devices: Vec<Device>) -> View {
-        let known: Vec<u8> = devices.iter().filter_map(|device| device.percent).collect();
-        View {
-            lowest: known.iter().copied().min(),
-            average: (!known.is_empty())
-                .then(|| (known.iter().map(|value| u32::from(*value)).sum::<u32>() / known.len() as u32) as u8),
-            devices,
-            ..Default::default()
-        }
-    }
-
     #[test]
     fn the_tray_icon_follows_the_chosen_metric() {
-        let view = view(vec![device("Headset", Some(40), false), device("Mouse", Some(80), false)]);
+        let mut view = View {
+            devices: vec![
+                device("Earbuds", Some(5), true),
+                device("Headset", Some(40), false),
+                device("Mouse", Some(80), false),
+            ],
+            lowest: Some(40),
+            average: Some(60),
+            ..Default::default()
+        };
+        view.devices[0].status = "Not connected".to_owned();
         let mut settings = Settings::default();
         assert_eq!(icon_content(&view, &settings), IconContent::Percent(40));
         settings.icon_metric = ICON_METRIC_AVERAGE.to_owned();
@@ -997,6 +999,10 @@ mod tests {
         settings.icon_metric = "device".to_owned();
         settings.icon_device_id = "ID:MOUSE".to_owned();
         assert_eq!(icon_content(&view, &settings), IconContent::Percent(80));
+        settings.icon_device_id = "id:earbuds".to_owned();
+        assert_eq!(icon_content(&view, &settings), IconContent::Unknown);
+        view.devices[0].status = "Connected".to_owned();
+        assert_eq!(icon_content(&view, &settings), IconContent::Percent(5));
         settings.icon_device_id = "id:gone".to_owned();
         assert_eq!(icon_content(&view, &settings), IconContent::Unknown);
         assert_eq!(icon_content(&View::default(), &Settings::default()), IconContent::Unknown);
@@ -1004,7 +1010,12 @@ mod tests {
 
     #[test]
     fn tooltips_and_summaries_match_the_original_wording() {
-        let view = view(vec![device("Headset\r\nX", Some(40), false), device(" ", None, false)]);
+        let mut unknown = device(" ", None, false);
+        unknown.status = "Connected".to_owned();
+        let view = View {
+            devices: vec![device("Headset\r\nX", Some(40), false), unknown, device("Earbuds", Some(5), true)],
+            ..Default::default()
+        };
         assert_eq!(native_tooltip(&view), "Headset  X 40%\r\nWireless device ?%");
         assert_eq!(summary_line(view.devices.first()), "Headset\r\nX: 40%");
         assert_eq!(summary_line(view.devices.get(1)), "Wireless device: unavailable");
